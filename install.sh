@@ -47,6 +47,21 @@ PY_MINOR=$(echo "$PY_VERSION" | cut -d. -f2)
 if [[ "$PY_MAJOR" -lt 3 ]] || [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -lt 10 ]]; then
     fail "Python 3.10+ required. Found: Python $PY_VERSION"
 fi
+
+if [[ "$PY_MAJOR" -eq 3 && "$PY_MINOR" -ge 14 ]]; then
+    warn "Python $PY_VERSION detected — too new for some dependencies."
+    echo "   Several packages (e.g. miniaudio) lack pre-built wheels for Python 3.14+,"
+    echo "   which will cause build failures during installation."
+    echo ""
+    echo "   Recommended: Python 3.12 (most compatible with MLX ecosystem)"
+    echo "   Install with:  brew install python@3.12"
+    echo "   Then re-run:   python3.12 -m venv .venv && ./install.sh"
+    echo ""
+    read -rp "   Continue anyway? (y/N) " py_choice
+    if [[ "$py_choice" != "y" && "$py_choice" != "Y" ]]; then
+        exit 1
+    fi
+fi
 ok "Python $PY_VERSION"
 
 # ── Preflight: ffmpeg ─────────────────────────────────────────────────────────
