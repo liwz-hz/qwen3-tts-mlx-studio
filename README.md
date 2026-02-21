@@ -1,4 +1,4 @@
-# Qwen3-TTS Studio
+# Qwen3-TTS MLX Studio
 
 Local text-to-speech on Apple Silicon, powered by [Qwen3-TTS](https://huggingface.co/Qwen) and [mlx-audio](https://github.com/Blaizzy/mlx-audio). Runs entirely on-device — no API keys, no internet required after the initial model download.
 
