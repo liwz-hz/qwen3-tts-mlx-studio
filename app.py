@@ -1,5 +1,14 @@
-import argparse
 import os
+import warnings
+
+# Suppress known-harmless upstream warnings:
+# - "model of type qwen3_tts to instantiate a model of type ." (unregistered model type)
+# - "incorrect regex pattern ... fix_mistral_regex=True" (Qwen2Tokenizer regex issue)
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+# - "Trying to convert audio automatically from float32 to 16-bit int format" (Gradio)
+warnings.filterwarnings("ignore", message="Trying to convert audio")
+
+import argparse
 import concurrent.futures
 import shutil
 import sys

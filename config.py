@@ -1,6 +1,6 @@
 # Model defaults
 DEFAULT_MODEL_SIZE = "1.7B"
-DEFAULT_QUANTIZATION = "8bit"
+DEFAULT_QUANTIZATION = "bf16"
 
 # HuggingFace repo template
 REPO_TEMPLATE = "mlx-community/Qwen3-TTS-12Hz-{size}-{variant}-{quant}"
