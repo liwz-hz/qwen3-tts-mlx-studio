@@ -356,6 +356,75 @@ def generate_voice_clone(text, ref_audio, ref_text, language, library_voice):
 
 
 # ---------------------------------------------------------------------------
+# ASR transcription handlers
+# ---------------------------------------------------------------------------
+def transcribe_reference(ref_audio):
+    """Transcribe reference audio and fill the transcript box."""
+    if not ref_audio:
+        gr.Warning("Upload reference audio first.")
+        return gr.update(), "No audio to transcribe"
+    yield gr.update(), "Loading ASR model..."
+    try:
+        text = engine.transcribe(ref_audio, language="auto")
+        if not text or not text.strip():
+            yield gr.update(), "Transcription returned empty — try a clearer clip"
+            return
+        yield gr.update(value=text.strip()), f"Transcribed ({len(text.split())} words)"
+    except Exception as e:
+        gr.Warning(f"Transcription failed: {e}")
+        yield gr.update(), f"Error: {e}"
+
+
+def transcribe_yt_clip(clip_audio):
+    """Transcribe extracted YT clip audio."""
+    if not clip_audio:
+        gr.Warning("Extract a clip first (Step 2).")
+        return gr.update(), "No clip to transcribe"
+    yield gr.update(), "Loading ASR model..."
+    try:
+        text = engine.transcribe(clip_audio, language="auto")
+        if not text or not text.strip():
+            yield gr.update(), "Transcription returned empty"
+            return
+        yield gr.update(value=text.strip()), f"Transcribed ({len(text.split())} words)"
+    except Exception as e:
+        gr.Warning(f"Transcription failed: {e}")
+        yield gr.update(), f"Error: {e}"
+
+
+def transcribe_audio(audio_path, language):
+    """Standalone transcription handler."""
+    if not audio_path:
+        gr.Warning("Upload or record audio first.")
+        return gr.update(), "No audio"
+    lang = "auto" if language == "Auto" else language
+    yield gr.update(), "Loading ASR model..."
+    try:
+        text = engine.transcribe(audio_path, language=lang)
+        if not text or not text.strip():
+            yield gr.update(), "Transcription returned empty"
+            return
+        yield gr.update(value=text.strip()), f"Transcribed ({len(text.strip().split())} words)"
+    except Exception as e:
+        gr.Warning(f"Transcription failed: {e}")
+        yield gr.update(), f"Error: {e}"
+
+
+def save_transcript(text):
+    """Save transcription text to .txt file."""
+    if not text or not text.strip():
+        gr.Warning("No transcription to save.")
+        return "Nothing to save"
+    out_dir = app_settings["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(out_dir, f"transcript_{timestamp}.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return f"Saved: {path}"
+
+
+# ---------------------------------------------------------------------------
 # Batch generation handlers
 # ---------------------------------------------------------------------------
 def _run_batch_custom_voice(text, speaker, language, instruct, split_mode, silence_ms, progress=gr.Progress()):
@@ -1039,7 +1108,7 @@ def apply_settings(
         parts.append("model unloaded")
     status = f"Settings applied — {', '.join(parts)}."
     lang_update = gr.update(value=default_language)
-    return status, lang_update, lang_update, lang_update, lang_update, lang_update
+    return status, lang_update, lang_update, lang_update, lang_update, lang_update, lang_update
 
 
 def reset_generation_defaults():
@@ -1055,7 +1124,12 @@ def reset_generation_defaults():
 
 def unload_model():
     engine.unload_model()
-    return "Model unloaded. RAM freed."
+    return "Model unloaded. RAM freed.", "Not loaded (loads on demand)"
+
+
+def unload_asr_setting():
+    engine.unload_asr()
+    return "ASR unloaded. RAM freed."
 
 
 def delete_cached_models():
@@ -1263,6 +1337,9 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                         sources=["upload", "microphone"],
                         buttons=["download"],
                     )
+                    with gr.Row():
+                        vc_transcribe_btn = gr.Button("Transcribe Reference", variant="secondary", scale=1)
+                    gr.HTML("<div class='text-hint'>Auto-fills transcript using Qwen3-ASR-1.7B-8bit</div>")
                     vc_ref_text = gr.Textbox(
                         label="Reference Transcript (required)",
                         lines=2,
@@ -1356,6 +1433,8 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                         lines=3,
                         placeholder="Transcript appears here after extraction, or enter manually…",
                     )
+                    yt_transcribe_btn = gr.Button("Transcribe Clip", variant="secondary")
+                    gr.HTML("<div class='text-hint'>Use ASR when subtitles are unavailable or inaccurate</div>")
 
                     gr.Markdown("**Step 4 — Generate & Save**", elem_classes=["yt-step"])
                     yt_text = gr.Textbox(
@@ -1491,7 +1570,50 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                     sm_status = gr.Textbox(label="Status", interactive=False)
 
         # =================================================================
-        # Tab 6: Voice Library
+        # Tab 6: Transcription
+        # =================================================================
+        with gr.Tab("Transcription"):
+            gr.HTML(
+                "<div class='info-notice'>"
+                "Transcribe audio files locally using Qwen3-ASR. "
+                "Supports up to ~20 minutes of audio."
+                "</div>"
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    asr_audio = gr.Audio(
+                        label="Upload Audio",
+                        type="filepath",
+                        sources=["upload", "microphone"],
+                    )
+                    with gr.Row():
+                        asr_language = gr.Dropdown(
+                            choices=["Auto"] + LANGUAGES,
+                            value="Auto",
+                            label="Language",
+                        )
+                    asr_transcribe_btn = gr.Button("Transcribe", variant="primary")
+                    asr_output = gr.Textbox(
+                        label="Transcription",
+                        lines=12,
+                    )
+                    with gr.Row():
+                        asr_save_btn = gr.Button("Save as .txt")
+                        asr_save_status = gr.Textbox(
+                            show_label=False, interactive=False,
+                            placeholder="Save path appears here...",
+                            elem_classes=["save-status-text"],
+                        )
+                with gr.Column(scale=1, elem_classes=["output-col"]):
+                    asr_info = gr.Markdown(
+                        "**Model:** Qwen3-ASR-1.7B-8bit\n\n"
+                        "**Supported languages:** Auto-detect, English, Chinese, Japanese, Korean, "
+                        "German, French, Russian, Portuguese, Spanish, Italian\n\n"
+                        "**Max duration:** ~20 minutes per file"
+                    )
+
+        # =================================================================
+        # Tab 7: Voice Library
         # =================================================================
         with gr.Tab("Voice Library"):
             with gr.Row():
@@ -1539,7 +1661,7 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                     lib_import_btn = gr.Button("Import Voice", variant="primary")
 
         # =================================================================
-        # Tab 7: History
+        # Tab 8: History
         # =================================================================
         with gr.Tab("History"):
             hist_table = gr.Dataframe(
@@ -1576,7 +1698,7 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                 )
 
         # =================================================================
-        # Tab 8: Settings
+        # Tab 9: Settings
         # =================================================================
         with gr.Tab("Settings"):
             with gr.Row():
@@ -1620,6 +1742,14 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                         placeholder="Models will be re-downloaded on next use.",
                         elem_classes=["save-status-text"],
                     )
+                    gr.Markdown("### Speech Recognition")
+                    set_asr_status = gr.Textbox(
+                        label="ASR Model",
+                        value="Not loaded (loads on demand)",
+                        interactive=False,
+                        elem_classes=["model-status"],
+                    )
+                    set_asr_unload = gr.Button("Unload ASR Model")
 
                 # --- Generation column ---
                 with gr.Column(scale=1):
@@ -1760,6 +1890,12 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
     )
 
     # --- Voice Cloning ---
+    vc_transcribe_btn.click(
+        fn=transcribe_reference,
+        inputs=[vc_ref_audio],
+        outputs=[vc_ref_text, status],
+        show_progress="minimal",
+    )
     vc_generate.click(
         fn=generate_voice_clone,
         inputs=[vc_text, vc_ref_audio, vc_ref_text, vc_language, vc_library_voice],
@@ -1816,12 +1952,31 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
         outputs=[yt_clip_audio, yt_transcript, yt_status],
         show_progress="full",
     )
+    yt_transcribe_btn.click(
+        fn=transcribe_yt_clip,
+        inputs=[yt_clip_audio],
+        outputs=[yt_transcript, yt_status],
+        show_progress="minimal",
+    )
 
     yt_clone_btn.click(
         fn=clone_yt_voice,
         inputs=[yt_text, yt_clip_audio, yt_transcript, yt_language, yt_voice_name],
         outputs=[yt_audio_out, status, yt_status, vc_library_voice, lib_table],
         show_progress="minimal",
+    )
+
+    # --- Transcription ---
+    asr_transcribe_btn.click(
+        fn=transcribe_audio,
+        inputs=[asr_audio, asr_language],
+        outputs=[asr_output, status],
+        show_progress="minimal",
+    )
+    asr_save_btn.click(
+        fn=save_transcript,
+        inputs=[asr_output],
+        outputs=[asr_save_status],
     )
 
     # --- Script Mode ---
@@ -2010,7 +2165,7 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
         ],
         outputs=[
             set_status,
-            cv_language, vd_language, vc_language, yt_language, lib_import_language,
+            cv_language, vd_language, vc_language, yt_language, asr_language, lib_import_language,
         ],
     )
     set_reset.click(
@@ -2019,7 +2174,11 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
     )
     set_unload.click(
         fn=unload_model,
-        outputs=[set_status],
+        outputs=[set_status, set_asr_status],
+    )
+    set_asr_unload.click(
+        fn=unload_asr_setting,
+        outputs=[set_asr_status],
     )
     set_delete_models.click(
         fn=delete_cached_models,

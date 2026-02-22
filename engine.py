@@ -4,8 +4,9 @@ import threading
 import mlx.core as mx
 import numpy as np
 from mlx_audio.tts.utils import load_model
+from mlx_audio.stt.utils import load_model as load_stt_model
 
-from config import REPO_TEMPLATE, MODEL_VARIANTS, DEFAULT_MODEL_SIZE, DEFAULT_QUANTIZATION, ENABLE_JIT_COMPILE
+from config import REPO_TEMPLATE, MODEL_VARIANTS, DEFAULT_MODEL_SIZE, DEFAULT_QUANTIZATION, ENABLE_JIT_COMPILE, ASR_REPO_ID
 
 LOCK_TIMEOUT = 10  # seconds to wait for lock before raising
 
@@ -19,6 +20,7 @@ class TTSEngine:
         self.model_size = DEFAULT_MODEL_SIZE
         self.quantization = DEFAULT_QUANTIZATION
         self.jit_compile = ENABLE_JIT_COMPILE
+        self.asr_model = None
         self._lock = threading.Lock()
 
     def _acquire_lock(self):
@@ -37,6 +39,7 @@ class TTSEngine:
 
     def _load_model(self, model_type: str):
         """Load model, unloading previous if different. Caller must hold lock."""
+        self._unload_asr_unlocked()
         if self.current_model_type == model_type:
             return
         self._unload_model_unlocked()
@@ -70,7 +73,8 @@ class TTSEngine:
             self._lock.release()
 
     def _unload_model_unlocked(self):
-        """Free memory from current model. Caller must hold lock."""
+        """Free memory from current model (and ASR if loaded). Caller must hold lock."""
+        self._unload_asr_unlocked()
         if self.current_model is not None:
             del self.current_model
             self.current_model = None
@@ -121,6 +125,45 @@ class TTSEngine:
             )
             return self._to_numpy(results[0])
         finally:
+            self._lock.release()
+
+    # ----- ASR -----
+
+    def _load_asr(self):
+        """Load ASR model, unloading TTS first. Caller must hold lock."""
+        if self.asr_model is not None:
+            return  # already loaded
+        self._unload_model_unlocked()  # free TTS
+        self.asr_model = load_stt_model(ASR_REPO_ID)
+        mx.eval(self.asr_model.parameters())
+
+    def _unload_asr_unlocked(self):
+        """Free ASR model. Caller must hold lock."""
+        if self.asr_model is not None:
+            del self.asr_model
+            self.asr_model = None
+            gc.collect()
+
+    def unload_asr(self):
+        """Free ASR model (thread-safe)."""
+        self._acquire_lock()
+        try:
+            self._unload_asr_unlocked()
+        finally:
+            self._lock.release()
+
+    def is_asr_loaded(self) -> bool:
+        return self.asr_model is not None
+
+    def transcribe(self, audio_path, language="auto") -> str:
+        """Transcribe audio file, returns text. Loads/unloads ASR automatically."""
+        self._acquire_lock()
+        try:
+            self._load_asr()
+            result = self.asr_model.generate(audio_path, language=language)
+            return result.text
+        finally:
+            self._unload_asr_unlocked()
             self._lock.release()
 
     def _to_numpy(self, result) -> tuple:

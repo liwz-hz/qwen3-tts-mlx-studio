@@ -12,6 +12,9 @@ MODEL_VARIANTS = {
     "base": "Base",
 }
 
+# ASR model (fixed — do not change size/quant)
+ASR_REPO_ID = "mlx-community/Qwen3-ASR-1.7B-8bit"
+
 # Supported languages
 LANGUAGES = [
     "English", "Chinese", "Japanese", "Korean",
