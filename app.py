@@ -19,12 +19,15 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 
-from audio_utils import concatenate_audio, split_text
+from audio_utils import concatenate_audio, export_audio, split_text
 from config import (
     DEFAULT_AUTOSAVE,
     DEFAULT_BATCH_SPLIT_MODE,
+    DEFAULT_EXPORT_FORMAT,
+    DEFAULT_LOUDNORM,
     DEFAULT_MAX_TOKENS,
     DEFAULT_MODEL_SIZE,
+    DEFAULT_MP3_BITRATE,
     DEFAULT_QUANTIZATION,
     DEFAULT_REPETITION_PENALTY,
     DEFAULT_SCRIPT_SILENCE_MS,
@@ -34,6 +37,7 @@ from config import (
     DEFAULT_TIMEOUT,
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
+    DEFAULT_TRIM_SILENCE,
     ENABLE_JIT_COMPILE,
     HISTORY_DIR,
     LANGUAGES,
@@ -120,6 +124,10 @@ app_settings = {
     "timeout": DEFAULT_TIMEOUT,
     "output_dir": OUTPUT_DIR,
     "autosave": DEFAULT_AUTOSAVE,
+    "export_format": DEFAULT_EXPORT_FORMAT,
+    "mp3_bitrate": DEFAULT_MP3_BITRATE,
+    "loudnorm": DEFAULT_LOUDNORM,
+    "trim_silence": DEFAULT_TRIM_SILENCE,
     "default_language": "English",
 }
 
@@ -163,10 +171,21 @@ def save_audio(audio_tuple, prefix="output"):
     sr, audio = audio_tuple
     out_dir = app_settings["output_dir"]
     os.makedirs(out_dir, exist_ok=True)
+    fmt = app_settings["export_format"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(out_dir, f"{prefix}_{timestamp}.wav")
-    sf.write(path, audio, sr)
-    return f"Saved: {path}"
+    final_path = export_audio(
+        audio=audio,
+        sr=sr,
+        output_path=path,
+        fmt=fmt,
+        mp3_bitrate=app_settings["mp3_bitrate"],
+        loudnorm=app_settings["loudnorm"],
+        trim_silence=app_settings["trim_silence"],
+    )
+    if fmt != "wav" and final_path.endswith(".wav"):
+        gr.Warning(f"ffmpeg not available — saved as WAV instead of {fmt.upper()}.")
+    return f"Saved: {final_path}"
 
 
 def _get_hf_cache_dir() -> str:
@@ -771,7 +790,7 @@ def history_clear():
     return history.table_data(), "History cleared"
 
 
-def history_save_wav(entry_id):
+def history_save_audio(entry_id):
     """Save a history entry's audio to the output directory."""
     if not entry_id or entry_id == "(empty)":
         return "Select an entry first"
@@ -1079,6 +1098,7 @@ def apply_settings(
     model_size, quantization,
     temperature, top_k, top_p, repetition_penalty, max_tokens, timeout,
     output_dir, autosave, jit_compile, default_language,
+    export_format, mp3_bitrate, loudnorm, trim_silence,
 ):
     model_changed = (
         model_size != engine.model_size
@@ -1099,6 +1119,10 @@ def apply_settings(
     app_settings["timeout"] = int(timeout)
     app_settings["output_dir"] = output_dir.strip() or OUTPUT_DIR
     app_settings["autosave"] = autosave
+    app_settings["export_format"] = export_format
+    app_settings["mp3_bitrate"] = int(mp3_bitrate)
+    app_settings["loudnorm"] = loudnorm
+    app_settings["trim_silence"] = trim_silence
     app_settings["default_language"] = default_language
 
     os.makedirs(app_settings["output_dir"], exist_ok=True)
@@ -1106,9 +1130,9 @@ def apply_settings(
     parts = [f"size: {model_size}, quant: {quantization}"]
     if model_changed:
         parts.append("model unloaded")
-    status = f"Settings applied — {', '.join(parts)}."
+    msg = f"Settings applied — {', '.join(parts)}."
     lang_update = gr.update(value=default_language)
-    return status, lang_update, lang_update, lang_update, lang_update, lang_update, lang_update
+    return msg, msg, lang_update, lang_update, lang_update, lang_update, lang_update, lang_update
 
 
 def reset_generation_defaults():
@@ -1232,11 +1256,11 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                         )
                         cv_batch_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False, buttons=["download"])
                         with gr.Row():
-                            cv_batch_save = gr.Button("Save Combined WAV")
+                            cv_batch_save = gr.Button("Save Combined Audio")
                             cv_batch_status = gr.Textbox(label="Batch Status", interactive=False)
                 with gr.Column(scale=1, elem_classes=["output-col"]):
                     cv_audio = gr.Audio(label="Output", type="numpy", interactive=False, buttons=["download"])
-                    cv_save = gr.Button("Save WAV")
+                    cv_save = gr.Button("Save Audio")
                     cv_save_status = gr.Textbox(
                         show_label=False, interactive=False,
                         placeholder="Save path appears here…",
@@ -1299,11 +1323,11 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                         )
                         vd_batch_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False, buttons=["download"])
                         with gr.Row():
-                            vd_batch_save = gr.Button("Save Combined WAV")
+                            vd_batch_save = gr.Button("Save Combined Audio")
                             vd_batch_status = gr.Textbox(label="Batch Status", interactive=False)
                 with gr.Column(scale=1, elem_classes=["output-col"]):
                     vd_audio = gr.Audio(label="Output", type="numpy", interactive=False, buttons=["download"])
-                    vd_save = gr.Button("Save WAV")
+                    vd_save = gr.Button("Save Audio")
                     vd_save_status = gr.Textbox(
                         show_label=False, interactive=False,
                         placeholder="Save path appears here…",
@@ -1383,11 +1407,11 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                         )
                         vc_batch_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False, buttons=["download"])
                         with gr.Row():
-                            vc_batch_save = gr.Button("Save Combined WAV")
+                            vc_batch_save = gr.Button("Save Combined Audio")
                             vc_batch_status = gr.Textbox(label="Batch Status", interactive=False)
                 with gr.Column(scale=1, elem_classes=["output-col"]):
                     vc_audio = gr.Audio(label="Output", type="numpy", interactive=False, buttons=["download"])
-                    vc_save = gr.Button("Save WAV")
+                    vc_save = gr.Button("Save Audio")
                     vc_save_status = gr.Textbox(
                         show_label=False, interactive=False,
                         placeholder="Save path appears here…",
@@ -1557,7 +1581,7 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
 
                     with gr.Row():
                         sm_generate_btn = gr.Button("Generate Script", variant="primary")
-                        sm_save_btn = gr.Button("Save Combined WAV")
+                        sm_save_btn = gr.Button("Save Combined Audio")
 
                 with gr.Column(scale=1):
                     sm_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False, buttons=["download"])
@@ -1681,7 +1705,7 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                 hist_preview_btn = gr.Button("Preview", scale=1)
                 hist_delete_btn = gr.Button("Delete Entry", scale=1)
             with gr.Row():
-                hist_save_btn = gr.Button("Save WAV", scale=1)
+                hist_save_btn = gr.Button("Save Audio", scale=1)
                 hist_regen_btn = gr.Button("Show Params", scale=1)
                 hist_clear_btn = gr.Button("Clear All History", scale=1)
             hist_status = gr.Textbox(
@@ -1790,6 +1814,26 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
                     set_autosave = gr.Checkbox(
                         value=DEFAULT_AUTOSAVE,
                         label="Auto-save generated audio",
+                    )
+                    gr.Markdown("### Export Format")
+                    set_export_format = gr.Radio(
+                        ["wav", "mp3", "ogg"],
+                        value=DEFAULT_EXPORT_FORMAT,
+                        label="Audio Format",
+                    )
+                    set_mp3_bitrate = gr.Slider(
+                        64, 320, value=DEFAULT_MP3_BITRATE, step=32,
+                        label="MP3 Bitrate (kbps)",
+                        visible=False,
+                    )
+                    gr.Markdown("### Post-Processing")
+                    set_loudnorm = gr.Checkbox(
+                        value=DEFAULT_LOUDNORM,
+                        label="EBU R128 loudness normalization",
+                    )
+                    set_trim_silence = gr.Checkbox(
+                        value=DEFAULT_TRIM_SILENCE,
+                        label="Trim leading/trailing silence",
                     )
                     set_default_language = gr.Dropdown(
                         choices=LANGUAGES,
@@ -2144,7 +2188,7 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
         outputs=[hist_table, hist_status],
     )
     hist_save_btn.click(
-        fn=history_save_wav,
+        fn=history_save_audio,
         inputs=[hist_selected],
         outputs=[hist_status],
     )
@@ -2155,6 +2199,11 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
     )
 
     # --- Settings ---
+    set_export_format.change(
+        fn=lambda fmt: gr.update(visible=(fmt == "mp3")),
+        inputs=[set_export_format],
+        outputs=[set_mp3_bitrate],
+    )
     set_apply.click(
         fn=apply_settings,
         inputs=[
@@ -2162,9 +2211,10 @@ with gr.Blocks(title="Qwen3-TTS Studio") as app:
             set_temperature, set_top_k, set_top_p, set_rep_penalty,
             set_max_tokens, set_timeout,
             set_output_dir, set_autosave, set_jit, set_default_language,
+            set_export_format, set_mp3_bitrate, set_loudnorm, set_trim_silence,
         ],
         outputs=[
-            set_status,
+            set_status, status,
             cv_language, vd_language, vc_language, yt_language, asr_language, lib_import_language,
         ],
     )

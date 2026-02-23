@@ -58,6 +58,10 @@ DEFAULT_TIMEOUT = 120
 
 # Output defaults
 DEFAULT_AUTOSAVE = False
+DEFAULT_EXPORT_FORMAT = "wav"    # "wav", "mp3", "ogg"
+DEFAULT_MP3_BITRATE = 192       # kbps
+DEFAULT_LOUDNORM = False        # EBU R128 loudness normalization
+DEFAULT_TRIM_SILENCE = False    # Strip leading/trailing silence
 
 # JIT compilation — set False to disable if you hit issues
 ENABLE_JIT_COMPILE = True

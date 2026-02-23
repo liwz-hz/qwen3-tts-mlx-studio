@@ -1,8 +1,13 @@
 """Audio utility functions for batch and script generation."""
 
+import os
 import re
+import shutil
+import subprocess
+import tempfile
 
 import numpy as np
+import soundfile as sf
 
 from config import DEFAULT_SAMPLE_RATE
 
@@ -68,3 +73,77 @@ def split_text(text: str, mode: str = "paragraph") -> list[str]:
         raise ValueError(f"Unknown split mode: {mode}")
 
     return [s.strip() for s in segments if s.strip()]
+
+
+def check_ffmpeg() -> bool:
+    """Return True if ffmpeg is available on PATH."""
+    return shutil.which("ffmpeg") is not None
+
+
+def export_audio(
+    audio: np.ndarray,
+    sr: int,
+    output_path: str,
+    fmt: str = "wav",
+    mp3_bitrate: int = 192,
+    loudnorm: bool = False,
+    trim_silence: bool = False,
+) -> str:
+    """Export audio to the specified format with optional post-processing.
+
+    Writes a temp WAV, runs ffmpeg for conversion/processing, cleans up temp.
+    Returns the final output path.  Falls back to plain WAV if ffmpeg is
+    unavailable and a non-WAV format was requested.
+    """
+    base, _ = os.path.splitext(output_path)
+    ext_map = {"wav": ".wav", "mp3": ".mp3", "ogg": ".ogg"}
+    final_path = base + ext_map.get(fmt, ".wav")
+
+    needs_ffmpeg = (fmt != "wav") or loudnorm or trim_silence
+
+    if not needs_ffmpeg:
+        sf.write(final_path, audio, sr)
+        return final_path
+
+    if not check_ffmpeg():
+        fallback_path = base + ".wav"
+        sf.write(fallback_path, audio, sr)
+        return fallback_path
+
+    tmp_fd, tmp_wav = tempfile.mkstemp(suffix=".wav")
+    os.close(tmp_fd)
+    try:
+        sf.write(tmp_wav, audio, sr)
+
+        filters = []
+        if trim_silence:
+            filters.append(
+                "silenceremove=start_periods=1:start_threshold=-50dB:start_duration=0.01,"
+                "areverse,"
+                "silenceremove=start_periods=1:start_threshold=-50dB:start_duration=0.01,"
+                "areverse"
+            )
+        if loudnorm:
+            filters.append("loudnorm=I=-16:TP=-1.5:LRA=11")
+
+        cmd = ["ffmpeg", "-y", "-i", tmp_wav]
+        if filters:
+            cmd += ["-af", ",".join(filters)]
+
+        if fmt == "mp3":
+            cmd += ["-codec:a", "libmp3lame", "-b:a", f"{mp3_bitrate}k"]
+        elif fmt == "ogg":
+            cmd += ["-codec:a", "libvorbis", "-q:a", "6"]
+
+        cmd += ["-ar", str(sr), "-ac", "1", final_path]
+
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"ffmpeg error: {result.stderr[:300]}")
+
+        return final_path
+    finally:
+        if os.path.isfile(tmp_wav):
+            os.remove(tmp_wav)
