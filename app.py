@@ -59,7 +59,7 @@ from yt_voice import get_yt_extractor
 # ---------------------------------------------------------------------------
 # CLI arguments
 # ---------------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Qwen3-TTS Studio")
+parser = argparse.ArgumentParser(description="Qwen3-TTS MLX Studio")
 parser.add_argument("--host", default=SERVER_HOST, help="Server host")
 parser.add_argument("--port", type=int, default=SERVER_PORT, help="Server port")
 parser.add_argument(
@@ -1215,11 +1215,11 @@ def get_model_status():
 # ---------------------------------------------------------------------------
 # Build Gradio UI
 # ---------------------------------------------------------------------------
-with gr.Blocks(title="Qwen3-TTS Studio") as app:
+with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
 
     gr.HTML(
         "<div class='app-header'>"
-        "<h1>Qwen3-TTS Studio</h1>"
+        "<h1>Qwen3-TTS MLX Studio</h1>"
         "<p class='subtitle'>Local AI Text-to-Speech &middot; MLX &middot; Apple Silicon</p>"
         "</div>"
     )
