@@ -19,10 +19,11 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 
-from audio_utils import concatenate_audio, export_audio, split_text
+from audio_utils import concatenate_audio, export_audio, split_text, unload_deepfilter
 from config import (
     DEFAULT_AUTOSAVE,
     DEFAULT_BATCH_SPLIT_MODE,
+    DEFAULT_DENOISE_REF,
     DEFAULT_EXPORT_FORMAT,
     DEFAULT_LOUDNORM,
     DEFAULT_MAX_TOKENS,
@@ -66,7 +67,7 @@ parser.add_argument(
     "--model-size", choices=["0.6B", "1.7B"], default=DEFAULT_MODEL_SIZE
 )
 parser.add_argument(
-    "--quant", choices=["8bit", "bf16"], default=DEFAULT_QUANTIZATION
+    "--quant", choices=["4bit", "6bit", "8bit", "bf16"], default=DEFAULT_QUANTIZATION
 )
 parser.add_argument(
     "--share", action="store_true", help="Create public Gradio link"
@@ -128,6 +129,7 @@ app_settings = {
     "mp3_bitrate": DEFAULT_MP3_BITRATE,
     "loudnorm": DEFAULT_LOUDNORM,
     "trim_silence": DEFAULT_TRIM_SILENCE,
+    "denoise_ref": DEFAULT_DENOISE_REF,
     "default_language": "English",
 }
 
@@ -348,6 +350,7 @@ def generate_voice_clone(text, ref_audio, ref_text, language, library_voice):
         start = time.time()
         sr, audio = generate_with_timeout(
             engine.generate_voice_clone, text, ref_audio, ref_text, language,
+            denoise_ref=app_settings["denoise_ref"],
             timeout_seconds=app_settings["timeout"],
             **_gen_kwargs(),
         )
@@ -362,9 +365,10 @@ def generate_voice_clone(text, ref_audio, ref_text, language, library_voice):
         save_msg = ""
         if app_settings["autosave"]:
             save_msg = " | " + save_audio(result, "clone")
+        denoise_msg = " | Noise reduction applied" if app_settings["denoise_ref"] else ""
         yield (
             gr.update(value=result),
-            f"Generated in {elapsed:.1f}s | Model: {engine.get_repo_id('base')}{save_msg}",
+            f"Generated in {elapsed:.1f}s | Model: {engine.get_repo_id('base')}{denoise_msg}{save_msg}",
         )
     except GenerationTimeout as e:
         gr.Warning(str(e))
@@ -571,6 +575,7 @@ def _run_batch_voice_clone(text, ref_audio, ref_text, language, library_voice, s
         try:
             sr, audio = generate_with_timeout(
                 engine.generate_voice_clone, seg, ref_audio, ref_text, language,
+                denoise_ref=app_settings["denoise_ref"],
                 timeout_seconds=app_settings["timeout"],
                 **_gen_kwargs(),
             )
@@ -594,6 +599,8 @@ def _run_batch_voice_clone(text, ref_audio, ref_text, language, library_voice, s
     status_msg = f"Generated {succeeded}/{len(segments)} segments"
     if failed:
         status_msg += f" ({failed} failed)"
+    if app_settings["denoise_ref"]:
+        status_msg += " | Noise reduction applied"
     return gr.update(value=combined), table_rows, status_msg
 
 
@@ -713,6 +720,7 @@ def generate_script_handler(raw_text, assignments_state, silence_ms, progress=gr
                     sr, audio = generate_with_timeout(
                         engine.generate_voice_clone,
                         line.text, ref_audio_path, ref_text, lang,
+                        denoise_ref=app_settings["denoise_ref"],
                         timeout_seconds=app_settings["timeout"],
                         **_gen_kwargs(),
                     )
@@ -759,6 +767,8 @@ def generate_script_handler(raw_text, assignments_state, silence_ms, progress=gr
     status_msg = f"Generated {succeeded}/{total_lines} lines"
     if failed:
         status_msg += f" ({failed} failed)"
+    if app_settings["denoise_ref"]:
+        status_msg += " | Noise reduction applied"
     return gr.update(value=combined), table_rows, status_msg
 
 
@@ -998,6 +1008,7 @@ def clone_yt_voice(text, ref_audio, transcript, language, voice_name):
         result = generate_with_timeout(
             engine.generate_voice_clone,
             text.strip(), ref_audio, transcript.strip(), language,
+            denoise_ref=app_settings["denoise_ref"],
             timeout_seconds=app_settings["timeout"],
             **_gen_kwargs(),
         )
@@ -1015,7 +1026,8 @@ def clone_yt_voice(text, ref_audio, transcript, language, voice_name):
         extra = ""
         if app_settings["autosave"]:
             extra = " | " + save_audio(result, "yt_clone")
-        status_msg = f"Generated in {elapsed:.1f}s | {lib_msg}{extra}"
+        denoise_msg = " | Noise reduction applied" if app_settings["denoise_ref"] else ""
+        status_msg = f"Generated in {elapsed:.1f}s | {lib_msg}{denoise_msg}{extra}"
         return (
             gr.update(value=result),
             status_msg,
@@ -1098,7 +1110,7 @@ def apply_settings(
     model_size, quantization,
     temperature, top_k, top_p, repetition_penalty, max_tokens, timeout,
     output_dir, autosave, jit_compile, default_language,
-    export_format, mp3_bitrate, loudnorm, trim_silence,
+    export_format, mp3_bitrate, loudnorm, trim_silence, denoise_ref,
 ):
     model_changed = (
         model_size != engine.model_size
@@ -1123,6 +1135,9 @@ def apply_settings(
     app_settings["mp3_bitrate"] = int(mp3_bitrate)
     app_settings["loudnorm"] = loudnorm
     app_settings["trim_silence"] = trim_silence
+    app_settings["denoise_ref"] = denoise_ref
+    if not denoise_ref:
+        unload_deepfilter()
     app_settings["default_language"] = default_language
 
     os.makedirs(app_settings["output_dir"], exist_ok=True)
@@ -1757,7 +1772,7 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                         label="Model Size",
                     )
                     set_quant = gr.Radio(
-                        ["8bit", "bf16"],
+                        ["4bit", "6bit", "8bit", "bf16"],
                         value=engine.quantization,
                         label="Quantization",
                     )
@@ -1768,15 +1783,22 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                         elem_classes=["model-status"],
                     )
                     set_unload = gr.Button("Unload Model / Free RAM")
-                    set_jit = gr.Checkbox(
-                        value=ENABLE_JIT_COMPILE,
-                        label="JIT compile model (faster after first run; unloads model on change)",
+                    gr.Markdown("### Reference Audio")
+                    set_denoise_ref = gr.Checkbox(
+                        value=DEFAULT_DENOISE_REF,
+                        label="Denoise reference audio (DeepFilterNet, 8MB model)",
+                        info="Pre-processes voice clone references to remove background noise",
                     )
                     gr.Markdown("### Language")
                     set_default_language = gr.Dropdown(
                         choices=LANGUAGES,
                         value="English",
                         label="Default Language",
+                    )
+                    set_jit = gr.Checkbox(
+                        value=ENABLE_JIT_COMPILE,
+                        label="JIT compile model (faster after first run; unloads model on change)",
+                        container=False,
                     )
                     with gr.Accordion("Model Cache & ASR", open=False, elem_classes=["settings-accordion"]):
                         gr.Markdown("### Model Cache")
@@ -2243,6 +2265,7 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
             set_max_tokens, set_timeout,
             set_output_dir, set_autosave, set_jit, set_default_language,
             set_export_format, set_mp3_bitrate, set_loudnorm, set_trim_silence,
+            set_denoise_ref,
         ],
         outputs=[
             set_status, status,

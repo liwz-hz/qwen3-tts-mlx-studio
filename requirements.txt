@@ -1,4 +1,4 @@
-mlx-audio>=0.3.1
+mlx-audio>=0.4.1,<0.5
 gradio>=5.0
 soundfile>=0.13
 numpy>=2.0

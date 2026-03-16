@@ -1,5 +1,6 @@
 """Audio utility functions for batch and script generation."""
 
+import gc
 import os
 import re
 import shutil
@@ -9,7 +10,62 @@ import tempfile
 import numpy as np
 import soundfile as sf
 
-from config import DEFAULT_SAMPLE_RATE
+from config import DEFAULT_SAMPLE_RATE, DEEPFILTER_REPO
+
+
+_deepfilter_model = None  # lazy singleton
+
+
+def _get_deepfilter_model():
+    """Load DeepFilterNet on first use (8MB download, cached after)."""
+    global _deepfilter_model
+    if _deepfilter_model is None:
+        from mlx_audio.sts.models.deepfilternet import DeepFilterNetModel
+        _deepfilter_model = DeepFilterNetModel.from_pretrained(DEEPFILTER_REPO)
+    return _deepfilter_model
+
+
+def denoise_ref_audio(input_path: str) -> str:
+    """Denoise a reference audio file via DeepFilterNet.
+
+    Loads audio, resamples to 48kHz, enhances, resamples back,
+    writes to a temp file. Returns path to denoised temp file.
+    Caller is responsible for cleanup.
+    """
+    model = _get_deepfilter_model()
+    audio, orig_sr = sf.read(input_path, dtype="float32")
+    # Mono
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    # Upsample to 48kHz (DeepFilterNet requirement)
+    target_sr = 48000
+    if orig_sr != target_sr:
+        ratio = target_sr / orig_sr
+        new_len = int(len(audio) * ratio)
+        indices = np.linspace(0, len(audio) - 1, new_len)
+        audio = np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+    # Enhance
+    enhanced = model.enhance_array(audio)
+    # Downsample back
+    if orig_sr != target_sr:
+        ratio = orig_sr / target_sr
+        new_len = int(len(enhanced) * ratio)
+        indices = np.linspace(0, len(enhanced) - 1, new_len)
+        enhanced = np.interp(indices, np.arange(len(enhanced)), enhanced).astype(np.float32)
+    # Write temp file
+    fd, tmp_path = tempfile.mkstemp(suffix=".wav")
+    os.close(fd)
+    sf.write(tmp_path, enhanced, orig_sr)
+    return tmp_path
+
+
+def unload_deepfilter():
+    """Free DeepFilterNet model from memory."""
+    global _deepfilter_model
+    if _deepfilter_model is not None:
+        del _deepfilter_model
+        _deepfilter_model = None
+        gc.collect()
 
 
 def normalize_audio(audio: np.ndarray, target_peak: float = 0.95) -> np.ndarray:

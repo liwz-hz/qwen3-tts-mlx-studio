@@ -34,7 +34,7 @@ If you don't have Homebrew yet, open Terminal and paste:
 
 **History** — Every generation is logged with mode, language, text, and duration. Replay audio, save files, or view original parameters.
 
-**Settings** — Model size and quantization, generation parameters (temperature, top-k, top-p, repetition penalty, max tokens, timeout), output directory, auto-save toggle, export format (WAV/MP3/OGG) with MP3 bitrate selector, post-processing (EBU R128 loudness normalization, silence trimming), JIT compilation toggle, ASR model management, YT cache management, and model cache management (view/delete downloaded models).
+**Settings** — Model size and quantization, generation parameters (temperature, top-k, top-p, repetition penalty, max tokens, timeout), output directory, auto-save toggle, export format (WAV/MP3/OGG) with MP3 bitrate selector, post-processing (EBU R128 loudness normalization, silence trimming, reference audio denoising via DeepFilterNet), JIT compilation toggle, ASR model management, YT cache management, and model cache management (view/delete downloaded models).
 
 ## Setup
 
@@ -59,7 +59,7 @@ The installer will:
 - Install ffmpeg if it's missing (required for audio processing)
 - Create a Python virtual environment (`.venv/`)
 - Install all Python dependencies
-- Optionally pre-download the TTS models (~6 GB total) — you can skip this and they'll download automatically the first time you use each mode
+- Optionally pre-download the TTS models (size varies by quantization) — you can skip this and they'll download automatically the first time you use each mode
 
 ## Usage
 
@@ -75,6 +75,7 @@ The UI opens in your browser at `http://localhost:7860`. Press Ctrl+C in the ter
 
 ```bash
 ./run.sh --model-size 0.6B   # Smaller, faster model (default: 1.7B)
+./run.sh --quant 4bit        # 4-bit quantization — smallest footprint
 ./run.sh --quant 8bit        # 8-bit quantization (default: bf16)
 ./run.sh --host 0.0.0.0      # Listen on all interfaces (e.g. access from another device)
 ./run.sh --port 8080          # Custom port
@@ -92,6 +93,8 @@ Three model variants, one per generation mode. Only one is loaded at a time (~6 
 | Custom Voice | CustomVoice | `mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-bf16` |
 | Voice Design | VoiceDesign | `mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-bf16` |
 | Voice Cloning | Base | `mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16` |
+
+All three variants are available in `bf16`, `8bit`, `6bit`, and `4bit` quantizations. Select in Settings or via `--quant`.
 
 ### ASR (Speech Recognition)
 
@@ -113,9 +116,11 @@ huggingface-cli download mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16
 huggingface-cli download mlx-community/Qwen3-ASR-1.7B-8bit
 ```
 
+Replace `bf16` with `8bit`, `6bit`, or `4bit` for smaller models.
+
 ## Output
 
-Audio is generated at 24 kHz mono and saved to `./outputs/` by default. Supported export formats are WAV (32-bit float), MP3 (configurable bitrate), and OGG/Vorbis — selectable in Settings. Optional post-processing includes EBU R128 loudness normalization and leading/trailing silence trimming (both via ffmpeg). Transcriptions are saved as `.txt` files in the same directory. Voice library profiles are stored in `./voices/`.
+Audio is generated at 24 kHz mono and saved to `./outputs/` by default. Supported export formats are WAV (32-bit float), MP3 (configurable bitrate), and OGG/Vorbis — selectable in Settings. Optional post-processing includes EBU R128 loudness normalization and leading/trailing silence trimming (both via ffmpeg). Reference audio for voice cloning can optionally be denoised with DeepFilterNet (toggle in Settings). Transcriptions are saved as `.txt` files in the same directory. Voice library profiles are stored in `./voices/`.
 
 ## Supported Languages
 
@@ -134,6 +139,7 @@ history.py        — Generation history log
 config.py         — Constants and defaults
 theme.py          — Dark theme and custom CSS
 install.sh        — One-step installer
+uninstall.sh      — Remove venv, caches, and downloaded models
 run.sh            — App launcher
 ```
 
@@ -141,9 +147,9 @@ run.sh            — App launcher
 
 **"Virtual environment not found"** — Run `./install.sh` first before `./run.sh`.
 
-**Model download is slow** — The first run downloads ~6 GB from HuggingFace. On a slow connection you can pre-download models (see the Models section above) or let the installer do it.
+**Model download is slow** — The first run downloads models from HuggingFace (~6 GB for bf16, less for quantized). On a slow connection you can pre-download models (see the Models section above) or let the installer do it.
 
-**Out of memory** — The 1.7B bf16 model uses ~6 GB of unified memory. If you're running low, try `./run.sh --model-size 0.6B` or `./run.sh --quant 8bit` for a smaller footprint.
+**Out of memory** — The 1.7B bf16 model uses ~6 GB of unified memory. If you're running low, try `./run.sh --model-size 0.6B` or `./run.sh --quant 4bit` for the smallest footprint.
 
 **ffmpeg not found** — Install it with `brew install ffmpeg`. It's required for audio processing and YouTube clip extraction.
 

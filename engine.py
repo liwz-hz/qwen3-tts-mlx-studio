@@ -1,4 +1,5 @@
 import gc
+import os
 import threading
 
 import mlx.core as mx
@@ -111,10 +112,16 @@ class TTSEngine:
         finally:
             self._lock.release()
 
-    def generate_voice_clone(self, text, ref_audio_path, ref_text, language="English", **kwargs) -> tuple:
+    def generate_voice_clone(self, text, ref_audio_path, ref_text, language="English",
+                             denoise_ref=False, **kwargs) -> tuple:
         """Returns (sample_rate, numpy_audio_array)."""
         self._acquire_lock()
+        tmp_denoised = None
         try:
+            if denoise_ref:
+                from audio_utils import denoise_ref_audio
+                tmp_denoised = denoise_ref_audio(ref_audio_path)
+                ref_audio_path = tmp_denoised
             self._load_model("base")
             results = list(
                 self.current_model.generate(
@@ -125,6 +132,8 @@ class TTSEngine:
             )
             return self._to_numpy(results[0])
         finally:
+            if tmp_denoised and os.path.isfile(tmp_denoised):
+                os.remove(tmp_denoised)
             self._lock.release()
 
     # ----- ASR -----

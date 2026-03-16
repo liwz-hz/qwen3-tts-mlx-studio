@@ -62,6 +62,10 @@ DEFAULT_EXPORT_FORMAT = "wav"    # "wav", "mp3", "ogg"
 DEFAULT_MP3_BITRATE = 192       # kbps
 DEFAULT_LOUDNORM = False        # EBU R128 loudness normalization
 DEFAULT_TRIM_SILENCE = False    # Strip leading/trailing silence
+DEFAULT_DENOISE_REF = False     # DeepFilterNet ref audio denoising
+
+# DeepFilterNet model (8MB, cached after first download)
+DEEPFILTER_REPO = "mlx-community/DeepFilterNet-mlx"
 
 # JIT compilation — set False to disable if you hit issues
 ENABLE_JIT_COMPILE = True

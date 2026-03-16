@@ -213,27 +213,29 @@ ok "Created output directories"
 # ── Optional: Pre-download models ─────────────────────────────────────────────
 echo ""
 info "Model download (optional)"
-gum style --foreground "$C_TEXT" "   The TTS models (~6 GB total) can be downloaded now, or they'll"
+gum style --foreground "$C_TEXT" "   The TTS models can be downloaded now, or they'll"
 gum style --foreground "$C_TEXT" "   download automatically when you first use each voice mode."
 echo ""
 
 if gum confirm --default=no "Download models now?"; then
-    info "Downloading models (this will take a while)..."
+    info "Select quantization (bf16 is default, 4bit is smallest):"
+    QUANT=$(gum choose --selected="bf16" "bf16" "8bit" "6bit" "4bit")
+    info "Downloading ${QUANT} models..."
     pip install -q huggingface_hub
 
-    gum spin --spinner dot --title "[1/3] Downloading CustomVoice model..." \
+    gum spin --spinner dot --title "[1/3] Downloading CustomVoice model (${QUANT})..." \
         --spinner.foreground "$C_BLUE" -- \
-        huggingface-cli download mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit --quiet
+        huggingface-cli download "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-${QUANT}" --quiet
     ok "CustomVoice model downloaded"
 
-    gum spin --spinner dot --title "[2/3] Downloading VoiceDesign model..." \
+    gum spin --spinner dot --title "[2/3] Downloading VoiceDesign model (${QUANT})..." \
         --spinner.foreground "$C_BLUE" -- \
-        huggingface-cli download mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit --quiet
+        huggingface-cli download "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-${QUANT}" --quiet
     ok "VoiceDesign model downloaded"
 
-    gum spin --spinner dot --title "[3/3] Downloading Base model (Voice Cloning)..." \
+    gum spin --spinner dot --title "[3/3] Downloading Base model (${QUANT})..." \
         --spinner.foreground "$C_BLUE" -- \
-        huggingface-cli download mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit --quiet
+        huggingface-cli download "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-${QUANT}" --quiet
     ok "Base model downloaded"
 else
     ok "Skipped — models will download on first use"
