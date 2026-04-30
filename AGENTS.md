@@ -130,6 +130,44 @@ modelscope download mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit
 
 UI 中的 "Delete Downloaded Models" 按钮会遍历 `~/.cache/modelscope/hub/models/mlx-community/` 目录，删除所有以 `Qwen3-TTS-12Hz-` 开头的模型目录。
 
+### Whisper 模型下载
+
+Whisper 模型用于生成带时间戳的字幕文件。由于 ModelScope 上的 MLX Whisper 模型缺少 tokenizer 文件，需要结合 HuggingFace 的 tokenizer 文件使用。
+
+**下载步骤：**
+
+1. **下载 ModelScope MLX 模型权重（~1.5GB）：**
+   ```bash
+   conda activate audio
+   python -c "from modelscope.hub.snapshot_download import snapshot_download; snapshot_download('mlx-community/whisper-large-v3-turbo')"
+   ```
+
+2. **下载 HuggingFace tokenizer 文件（~5MB）：**
+   ```bash
+   conda activate audio
+   python -c "from huggingface_hub import snapshot_download; snapshot_download('openai/whisper-large-v3-turbo', allow_patterns=['vocab.json', 'merges.txt', 'tokenizer.json', 'tokenizer_config.json'])"
+   ```
+
+3. **复制 tokenizer 文件到 MLX 模型目录：**
+   ```bash
+   # tokenizer 文件在 ~/.cache/huggingface/hub/models--openai--whisper-large-v3-turbo/snapshots/<hash>/
+   # 复制 vocab.json, merges.txt, tokenizer.json, tokenizer_config.json 到
+   # ~/.cache/modelscope/hub/models/mlx-community/whisper-large-v3-turbo/
+   ```
+
+**可用 Whisper 模型：**
+
+| 模型名称 | ModelScope 路径 | 大小 | 速度 | 说明 |
+|----------|----------------|------|------|------|
+| `tiny` | `mlx-community/whisper-tiny-mlx` | 39M | ~32x | 最快 |
+| `base` | `mlx-community/whisper-base-mlx` | 74M | ~16x | 快 |
+| `small` | `mlx-community/whisper-small-mlx` | 244M | ~6x | 中等 |
+| `medium` | `mlx-community/whisper-medium-mlx` | 769M | ~2x | 较慢 |
+| `large-v3-turbo` | `mlx-community/whisper-large-v3-turbo` | 1.5GB | ~8x | 推荐（速度和质量平衡）|
+| `large-v3` | `mlx-community/whisper-large-v3-mlx` | 1.5GB | ~1x | 最高质量 |
+
+**注意：** 所有 Whisper 模型都需要从 HuggingFace 下载对应的 tokenizer 文件（`openai/whisper-<model-name>`）。
+
 ## 配置文件 (`config.py`)
 
 | 配置项 | 值 | 说明 |
@@ -139,6 +177,8 @@ UI 中的 "Delete Downloaded Models" 按钮会遍历 `~/.cache/modelscope/hub/mo
 | `DEFAULT_QUANTIZATION` | `bf16` | 默认量化精度（bf16/8bit/6bit/4bit） |
 | `ASR_REPO_ID` | `mlx-community/Qwen3-ASR-1.7B-8bit` | ASR 模型 |
 | `DEEPFILTER_REPO` | `mlx-community/DeepFilterNet-mlx` | 降噪模型 |
+| `WHISPER_MODEL_VARIANTS` | dict | Whisper 模型列表 |
+| `DEFAULT_WHISPER_MODEL` | `large-v3-turbo` | 默认 Whisper 模型 |
 
 ## Conda 环境
 

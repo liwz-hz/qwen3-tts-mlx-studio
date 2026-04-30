@@ -224,7 +224,22 @@ class TTSEngine:
         if not repo_id:
             raise ValueError(f"Unknown Whisper model: {model_name}")
         
-        self.whisper_model = load_stt_model(repo_id)
+        # Try to load from ModelScope cache first
+        local_path = os.path.join(
+            os.path.expanduser("~"),
+            ".cache",
+            "modelscope",
+            "hub",
+            "models",
+            repo_id.replace("/", "/")
+        )
+        
+        # Use local path if exists, otherwise let mlx_audio handle download
+        if os.path.isdir(local_path) and os.listdir(local_path):
+            self.whisper_model = load_stt_model(local_path)
+        else:
+            self.whisper_model = load_stt_model(repo_id)
+        
         self.whisper_model_name = model_name
         mx.eval(self.whisper_model.parameters())
 

@@ -28,7 +28,7 @@ WHISPER_MODEL_VARIANTS = {
     "base": "mlx-community/whisper-base-mlx",
     "small": "mlx-community/whisper-small-mlx",
     "medium": "mlx-community/whisper-medium-mlx",
-    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo",
     "large-v3": "mlx-community/whisper-large-v3-mlx",
 }
 DEFAULT_WHISPER_MODEL = "large-v3-turbo"
