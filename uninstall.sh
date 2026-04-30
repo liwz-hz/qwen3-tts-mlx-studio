@@ -14,20 +14,36 @@ C_TEXT="189"     # #c0caf5 — primary text
 C_MUTED="60"     # #565f89 — muted text
 C_BORDER="60"    # #3b4261 — borders
 
-# ── Bootstrap Gum ────────────────────────────────────────────────────────────
-if ! command -v gum &>/dev/null; then
-    if [[ -x ".gum_bin/gum" ]]; then
-        export PATH="$PWD/.gum_bin:$PATH"
-    elif command -v brew &>/dev/null; then
-        echo "Installing gum via Homebrew..."
-        brew install gum --quiet
-    else
-        echo "Downloading gum binary..."
-        mkdir -p .gum_bin
-        curl -fsSL "https://github.com/charmbracelet/gum/releases/download/v0.16.0/gum_0.16.0_Darwin_arm64.tar.gz" \
-            | tar xz -C .gum_bin gum
-        export PATH="$PWD/.gum_bin:$PATH"
+# ── Bootstrap Gum (skip if Homebrew broken) ──────────────────────────────────
+GUM_OK=0
+if command -v gum &>/dev/null; then
+    GUM_OK=1
+elif [[ -x ".gum_bin/gum" ]]; then
+    export PATH="$PWD/.gum_bin:$PATH"
+    GUM_OK=1
+elif command -v brew &>/dev/null; then
+    echo "Installing gum via Homebrew..."
+    export HOMEBREW_API_DOMAIN="https://mirrors.aliyun.com/homebrew/brew-api"
+    export HOMEBREW_BOTTLE_DOMAIN="https://mirrors.aliyun.com/homebrew/homebrew-bottles"
+    export HOMEBREW_NO_AUTO_UPDATE=1
+    export HOMEBREW_NO_INSTALL_UPGRADE=1
+    if brew install gum --quiet 2>/dev/null; then
+        GUM_OK=1
     fi
+fi
+
+if [[ "$GUM_OK" -ne 1 ]]; then
+    echo "  gum not available, using plain text output."
+    gum() {
+        local last=""
+        for arg in "$@"; do
+            case "$arg" in
+                --*) ;;
+                *) last="$arg" ;;
+            esac
+        done
+        echo "$last"
+    }
 fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -43,8 +59,8 @@ gum style --border double --border-foreground "$C_RED" \
     "Qwen3-TTS MLX Studio" "Uninstaller"
 echo ""
 
-# ── Resolve HuggingFace cache directory ──────────────────────────────────────
-HF_CACHE_DIR="${HF_HOME:-${HUGGINGFACE_HUB_CACHE:-$HOME/.cache/huggingface/hub}}"
+# ── Resolve ModelScope cache directory ──────────────────────────────────────
+MS_CACHE_DIR="$HOME/.cache/modelscope/hub/models/mlx-community"
 
 # ── Scan for artifacts ───────────────────────────────────────────────────────
 info "Scanning for installed artifacts..."
@@ -64,19 +80,6 @@ scan_local() {
     fi
 }
 
-scan_hf_model() {
-    local pattern="$1" label="$2"
-    for dir in "$HF_CACHE_DIR"/$pattern; do
-        if [[ -d "$dir" ]]; then
-            local size
-            size=$(du -sh "$dir" 2>/dev/null | cut -f1)
-            FOUND_ITEMS+=("$dir")
-            FOUND_LABELS+=("$label — $(basename "$dir") ($size)")
-            gum style --foreground "$C_TEXT" "  Found  $label  $(gum style --foreground "$C_MUTED" "$(basename "$dir")  $size")"
-        fi
-    done
-}
-
 # Local directories
 scan_local ".venv"        "Virtual environment"
 scan_local "outputs"      "Generated audio"
@@ -85,10 +88,34 @@ scan_local ".yt_cache"    "YouTube cache"
 scan_local "__pycache__"  "Python cache"
 scan_local ".gum_bin"     "Gum binary"
 
-# HuggingFace cached models
-scan_hf_model "models--mlx-community--Qwen3-TTS-12Hz-*"          "HF model"
-scan_hf_model "models--mlx-community--Qwen3-ASR-1.7B-8bit"       "HF model"
-scan_hf_model "models--mlx-community--DeepFilterNet-mlx"          "HF model"
+# ModelScope cached models
+if [[ -d "$MS_CACHE_DIR" ]]; then
+    for dir in "$MS_CACHE_DIR"/Qwen3-TTS-12Hz-*; do
+        if [[ -d "$dir" ]]; then
+            local size
+            size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+            FOUND_ITEMS+=("$dir")
+            FOUND_LABELS+=("MS model — $(basename "$dir") ($size)")
+            gum style --foreground "$C_TEXT" "  Found  MS model  $(gum style --foreground "$C_MUTED" "$(basename "$dir")  $size")"
+        fi
+    done
+    for model in "Qwen3-ASR-1.7B-8bit" "DeepFilterNet-mlx"; do
+        dir="$MS_CACHE_DIR/$model"
+        if [[ -d "$dir" ]]; then
+            size=$(du -sh "$dir" 2>/dev/null | cut -f1)
+            FOUND_ITEMS+=("$dir")
+            FOUND_LABELS+=("MS model — $model ($size)")
+            gum style --foreground "$C_TEXT" "  Found  MS model  $(gum style --foreground "$C_MUTED" "$model  $size")"
+        fi
+    done
+fi
+
+# Conda environment
+if conda env list 2>/dev/null | grep -q "^audio"; then
+    FOUND_ITEMS+=("conda:audio")
+    FOUND_LABELS+=("Conda environment 'audio'")
+    gum style --foreground "$C_TEXT" "  Found  Conda environment 'audio'"
+fi
 
 # ── Nothing to remove? ──────────────────────────────────────────────────────
 if [[ ${#FOUND_ITEMS[@]} -eq 0 ]]; then
@@ -133,31 +160,43 @@ remove_dir "voices"       "voice library (voices/)"
 remove_dir ".yt_cache"    "YouTube cache (.yt_cache/)"
 remove_dir "__pycache__"  "Python cache (__pycache__/)"
 
-# ── Delete cached models ────────────────────────────────────────────────────
-for dir in "$HF_CACHE_DIR"/models--mlx-community--Qwen3-TTS-12Hz-*; do
-    if [[ -d "$dir" ]]; then
-        rm -rf "$dir"
-        if [[ $? -eq 0 ]]; then
-            ok "Removed HF model: $(basename "$dir")"
-        else
-            warn "Failed to remove HF model: $(basename "$dir")"
+# ── Delete cached models from ModelScope ────────────────────────────────────
+if [[ -d "$MS_CACHE_DIR" ]]; then
+    for dir in "$MS_CACHE_DIR"/Qwen3-TTS-12Hz-*; do
+        if [[ -d "$dir" ]]; then
+            rm -rf "$dir"
+            if [[ $? -eq 0 ]]; then
+                ok "Removed MS model: $(basename "$dir")"
+            else
+                warn "Failed to remove MS model: $(basename "$dir")"
+            fi
         fi
-    fi
-done
+    done
 
-for model in "models--mlx-community--Qwen3-ASR-1.7B-8bit" "models--mlx-community--DeepFilterNet-mlx"; do
-    dir="$HF_CACHE_DIR/$model"
-    if [[ -d "$dir" ]]; then
-        rm -rf "$dir"
-        if [[ $? -eq 0 ]]; then
-            ok "Removed HF model: $model"
-        else
-            warn "Failed to remove HF model: $model"
+    for model in "Qwen3-ASR-1.7B-8bit" "DeepFilterNet-mlx"; do
+        dir="$MS_CACHE_DIR/$model"
+        if [[ -d "$dir" ]]; then
+            rm -rf "$dir"
+            if [[ $? -eq 0 ]]; then
+                ok "Removed MS model: $model"
+            else
+                warn "Failed to remove MS model: $model"
+            fi
         fi
-    fi
-done
+    done
+fi
 
-# ── Delete venv & gum ───────────────────────────────────────────────────────
+# ── Delete conda environment ───────────────────────────────────────────────
+if conda env list 2>/dev/null | grep -q "^audio"; then
+    conda env remove -n audio
+    if [[ $? -eq 0 ]]; then
+        ok "Removed conda environment 'audio'"
+    else
+        warn "Failed to remove conda environment 'audio'"
+    fi
+fi
+
+# ── Delete venv & gum (legacy) ─────────────────────────────────────────────
 remove_dir ".venv"     "virtual environment (.venv/)"
 remove_dir ".gum_bin"  "gum binary (.gum_bin/)"
 

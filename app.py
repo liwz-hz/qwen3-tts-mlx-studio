@@ -51,6 +51,15 @@ from config import (
     YT_CACHE_DIR,
 )
 from engine import TTSEngine
+from error_handler import (
+    UserInputError,
+    ResourceError,
+    SystemBusyError,
+    GenerationTimeoutError,
+    ERROR_MESSAGES,
+    with_error_popup,
+    with_error_popup_yield,
+)
 from history import GenerationHistory
 from script_parser import parse_script, group_by_model_type
 from theme import build_theme, custom_css
@@ -114,8 +123,20 @@ history = GenerationHistory()
 yt_extractor = get_yt_extractor()
 
 # ---------------------------------------------------------------------------
-# Runtime settings (mutated by Settings tab)
+# Logging setup - only warnings and errors to console, all levels to file
 # ---------------------------------------------------------------------------
+import logging
+import sys
+
+LOG_FILE = '/tmp/qwen3_tts_debug.log'
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding='utf-8'),
+    ],
+)
+logger = logging.getLogger(__name__)
 app_settings = {
     "temperature": DEFAULT_TEMPERATURE,
     "top_k": DEFAULT_TOP_K,
@@ -136,19 +157,13 @@ app_settings = {
 # ---------------------------------------------------------------------------
 # Timeout helper
 # ---------------------------------------------------------------------------
-class GenerationTimeout(Exception):
-    pass
-
-
 def generate_with_timeout(func, *func_args, timeout_seconds=120, **func_kwargs):
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
         future = pool.submit(func, *func_args, **func_kwargs)
         try:
             return future.result(timeout=timeout_seconds)
         except concurrent.futures.TimeoutError:
-            raise GenerationTimeout(
-                "Generation timed out — try shorter text or lower max_new_tokens"
-            )
+            raise GenerationTimeoutError(ERROR_MESSAGES["timeout"])
 
 
 # ---------------------------------------------------------------------------
@@ -168,8 +183,7 @@ def _gen_kwargs():
 def save_audio(audio_tuple, prefix="output"):
     """Save generated audio to the configured output directory."""
     if audio_tuple is None:
-        gr.Warning("No audio to save.")
-        return "No audio to save"
+        return "No audio to save."
     sr, audio = audio_tuple
     out_dir = app_settings["output_dir"]
     os.makedirs(out_dir, exist_ok=True)
@@ -186,25 +200,19 @@ def save_audio(audio_tuple, prefix="output"):
         trim_silence=app_settings["trim_silence"],
     )
     if fmt != "wav" and final_path.endswith(".wav"):
-        gr.Warning(f"ffmpeg not available — saved as WAV instead of {fmt.upper()}.")
+        pass  # ffmpeg was not available or failed
     return f"Saved: {final_path}"
 
 
 def _get_hf_cache_dir() -> str:
-    """Return the HuggingFace hub cache directory path."""
-    return (
-        os.environ.get("HF_HOME")
-        or os.environ.get("HUGGINGFACE_HUB_CACHE")
-        or os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub")
-    )
+    """Return the ModelScope hub cache directory path."""
+    from config import MODELSCOPE_CACHE_ROOT
+    return MODELSCOPE_CACHE_ROOT
 
 
 def _is_model_cached(repo_id: str) -> bool:
-    """Check whether a HuggingFace model repo is already in the local cache."""
-    hf_home = _get_hf_cache_dir()
-    cache_name = "models--" + repo_id.replace("/", "--")
-    snapshots = os.path.join(hf_home, cache_name, "snapshots")
-    return os.path.isdir(snapshots) and bool(os.listdir(snapshots))
+    """Check whether a ModelScope model is already in the local cache."""
+    return os.path.isdir(repo_id) and bool(os.listdir(repo_id))
 
 
 def _voice_choices():
@@ -226,217 +234,140 @@ def _voice_table():
 # ---------------------------------------------------------------------------
 # Generation handlers
 # ---------------------------------------------------------------------------
+@with_error_popup
 def generate_custom_voice(text, speaker, language, instruct):
     if not text.strip():
-        gr.Warning("Please enter text to speak.")
-        yield None, "Enter text first"
-        return
-    if not engine.is_model_loaded("custom_voice"):
-        repo_id = engine.get_repo_id("custom_voice")
-        if _is_model_cached(repo_id):
-            yield None, f"Loading model into memory… ({repo_id})"
-        else:
-            yield None, (
-                f"Downloading model on first run (~6 GB) — this may take several minutes… ({repo_id})"
-            )
-    try:
-        start = time.time()
-        sr, audio = generate_with_timeout(
-            engine.generate_custom_voice, text, speaker, language, instruct,
-            timeout_seconds=app_settings["timeout"],
-            **_gen_kwargs(),
-        )
-        elapsed = time.time() - start
-        result = (sr, audio)
-        # Record to history
-        history.add(
-            mode="custom_voice", text=text, language=language,
-            audio=result, speaker=speaker,
-            voice_params=instruct if instruct else "",
-        )
-        save_msg = ""
-        if app_settings["autosave"]:
-            save_msg = " | " + save_audio(result, "custom")
-        yield (
-            gr.update(value=result),
-            f"Generated in {elapsed:.1f}s | Model: {engine.get_repo_id('custom_voice')}{save_msg}",
-        )
-    except GenerationTimeout as e:
-        gr.Warning(str(e))
-        yield None, str(e)
-    except Exception as e:
-        gr.Warning(f"Generation failed: {e}")
-        yield None, f"Error: {e}"
+        raise UserInputError(ERROR_MESSAGES["empty_text"])
+    
+    start = time.time()
+    sr, audio = engine.generate_custom_voice(
+        text, speaker, language, instruct,
+        **_gen_kwargs(),
+    )
+    elapsed = time.time() - start
+    result = (sr, audio)
+    history.add(
+        mode="custom_voice", text=text, language=language,
+        audio=result, speaker=speaker,
+        voice_params=instruct if instruct else "",
+    )
+    save_msg = ""
+    if app_settings["autosave"]:
+        save_msg = " | " + save_audio(result, "custom")
+    status_text = f"✓ 完成 {elapsed:.1f}s | 模型: {engine.get_repo_id('custom_voice')}{save_msg}"
+    return result, status_text
 
 
+@with_error_popup
 def generate_voice_design(text, language, instruct):
     if not text.strip():
-        gr.Warning("Please enter text to speak.")
-        yield None, "Enter text first"
-        return
+        raise UserInputError(ERROR_MESSAGES["empty_text"])
     if not instruct.strip():
-        gr.Warning("Please describe the voice you want.")
-        yield None, "Describe the voice first"
-        return
-    if not engine.is_model_loaded("voice_design"):
-        repo_id = engine.get_repo_id("voice_design")
-        if _is_model_cached(repo_id):
-            yield None, f"Loading model into memory… ({repo_id})"
-        else:
-            yield None, (
-                f"Downloading model on first run (~6 GB) — this may take several minutes… ({repo_id})"
-            )
-    try:
-        start = time.time()
-        sr, audio = generate_with_timeout(
-            engine.generate_voice_design, text, language, instruct,
-            timeout_seconds=app_settings["timeout"],
-            **_gen_kwargs(),
-        )
-        elapsed = time.time() - start
-        result = (sr, audio)
-        # Record to history
-        history.add(
-            mode="voice_design", text=text, language=language,
-            audio=result, voice_params=instruct,
-        )
-        save_msg = ""
-        if app_settings["autosave"]:
-            save_msg = " | " + save_audio(result, "design")
-        yield (
-            gr.update(value=result),
-            f"Generated in {elapsed:.1f}s | Model: {engine.get_repo_id('voice_design')}{save_msg}",
-        )
-    except GenerationTimeout as e:
-        gr.Warning(str(e))
-        yield None, str(e)
-    except Exception as e:
-        gr.Warning(f"Generation failed: {e}")
-        yield None, f"Error: {e}"
+        raise UserInputError(ERROR_MESSAGES["empty_instruct"])
+    
+    start = time.time()
+    sr, audio = engine.generate_voice_design(
+        text, language, instruct,
+        **_gen_kwargs(),
+    )
+    elapsed = time.time() - start
+    result = (sr, audio)
+    history.add(
+        mode="voice_design", text=text, language=language,
+        audio=result, voice_params=instruct,
+    )
+    save_msg = ""
+    if app_settings["autosave"]:
+        save_msg = " | " + save_audio(result, "design")
+    status_text = f"✓ 完成 {elapsed:.1f}s | 模型: {engine.get_repo_id('voice_design')}{save_msg}"
+    return result, status_text
 
 
+@with_error_popup
 def generate_voice_clone(text, ref_audio, ref_text, language, library_voice):
     if not text.strip():
-        gr.Warning("Please enter text to speak.")
-        yield None, "Enter text first"
-        return
-    # If library voice selected, override ref_audio/ref_text
+        raise UserInputError(ERROR_MESSAGES["empty_text"])
     if library_voice and library_voice != "None":
         try:
             voice = library.load_voice(library_voice)
             ref_audio = library.get_ref_audio_path(library_voice)
             ref_text = voice["ref_text"]
         except FileNotFoundError:
-            gr.Warning(f"Voice '{library_voice}' not found in library.")
-            yield None, "Voice not found"
-            return
+            raise ResourceError(ERROR_MESSAGES["voice_not_found"].format(name=library_voice))
     if not ref_audio:
-        gr.Warning("Please upload reference audio or select from library.")
-        yield None, "No reference audio"
-        return
+        raise UserInputError(ERROR_MESSAGES["empty_ref_audio"])
     if not ref_text or not ref_text.strip():
-        gr.Warning("Reference transcript is required for voice cloning.")
-        yield None, "No reference transcript"
-        return
-    if not engine.is_model_loaded("base"):
-        repo_id = engine.get_repo_id("base")
-        if _is_model_cached(repo_id):
-            yield None, f"Loading model into memory… ({repo_id})"
-        else:
-            yield None, (
-                f"Downloading model on first run (~6 GB) — this may take several minutes… ({repo_id})"
-            )
-    try:
-        start = time.time()
-        sr, audio = generate_with_timeout(
-            engine.generate_voice_clone, text, ref_audio, ref_text, language,
-            denoise_ref=app_settings["denoise_ref"],
-            timeout_seconds=app_settings["timeout"],
-            **_gen_kwargs(),
-        )
-        elapsed = time.time() - start
-        result = (sr, audio)
-        # Record to history
-        voice_info = library_voice if library_voice and library_voice != "None" else "uploaded"
-        history.add(
-            mode="voice_clone", text=text, language=language,
-            audio=result, voice_params=f"ref: {voice_info}",
-        )
-        save_msg = ""
-        if app_settings["autosave"]:
-            save_msg = " | " + save_audio(result, "clone")
-        denoise_msg = " | Noise reduction applied" if app_settings["denoise_ref"] else ""
-        yield (
-            gr.update(value=result),
-            f"Generated in {elapsed:.1f}s | Model: {engine.get_repo_id('base')}{denoise_msg}{save_msg}",
-        )
-    except GenerationTimeout as e:
-        gr.Warning(str(e))
-        yield None, str(e)
-    except Exception as e:
-        gr.Warning(f"Generation failed: {e}")
-        yield None, f"Error: {e}"
+        raise UserInputError(ERROR_MESSAGES["empty_ref_text"])
+    
+    start = time.time()
+    sr, audio = engine.generate_voice_clone(
+        text, ref_audio, ref_text, language,
+        denoise_ref=app_settings["denoise_ref"],
+        **_gen_kwargs(),
+    )
+    elapsed = time.time() - start
+    result = (sr, audio)
+    voice_info = library_voice if library_voice and library_voice != "None" else "uploaded"
+    history.add(
+        mode="voice_clone", text=text, language=language,
+        audio=result, voice_params=f"ref: {voice_info}",
+    )
+    save_msg = ""
+    if app_settings["autosave"]:
+        save_msg = " | " + save_audio(result, "clone")
+    denoise_msg = " | 已降噪" if app_settings["denoise_ref"] else ""
+    status_text = f"✓ 完成 {elapsed:.1f}s | 模型: {engine.get_repo_id('base')}{denoise_msg}{save_msg}"
+    return result, status_text
+
+
+
 
 
 # ---------------------------------------------------------------------------
 # ASR transcription handlers
 # ---------------------------------------------------------------------------
+# ASR transcription handlers
+# ---------------------------------------------------------------------------
+@with_error_popup_yield
 def transcribe_reference(ref_audio):
     """Transcribe reference audio and fill the transcript box."""
     if not ref_audio:
-        gr.Warning("Upload reference audio first.")
-        return gr.update(), "No audio to transcribe"
-    yield gr.update(), "Loading ASR model..."
-    try:
-        text = engine.transcribe(ref_audio, language="auto")
-        if not text or not text.strip():
-            yield gr.update(), "Transcription returned empty — try a clearer clip"
-            return
-        yield gr.update(value=text.strip()), f"Transcribed ({len(text.split())} words)"
-    except Exception as e:
-        gr.Warning(f"Transcription failed: {e}")
-        yield gr.update(), f"Error: {e}"
+        raise UserInputError(ERROR_MESSAGES["empty_ref_audio"])
+    yield gr.update(), "加载 ASR 模型中..."
+    text = engine.transcribe(ref_audio, language="auto")
+    if not text or not text.strip():
+        raise UserInputError(ERROR_MESSAGES["asr_result_empty"])
+    yield gr.update(value=text.strip()), f"✓ 已转录 ({len(text.split())} 词)"
 
 
+@with_error_popup_yield
 def transcribe_yt_clip(clip_audio):
     """Transcribe extracted YT clip audio."""
     if not clip_audio:
-        gr.Warning("Extract a clip first (Step 2).")
-        return gr.update(), "No clip to transcribe"
-    yield gr.update(), "Loading ASR model..."
-    try:
-        text = engine.transcribe(clip_audio, language="auto")
-        if not text or not text.strip():
-            yield gr.update(), "Transcription returned empty"
-            return
-        yield gr.update(value=text.strip()), f"Transcribed ({len(text.split())} words)"
-    except Exception as e:
-        gr.Warning(f"Transcription failed: {e}")
-        yield gr.update(), f"Error: {e}"
+        raise UserInputError(ERROR_MESSAGES["asr_empty"])
+    yield gr.update(), "加载 ASR 模型中..."
+    text = engine.transcribe(clip_audio, language="auto")
+    if not text or not text.strip():
+        raise UserInputError(ERROR_MESSAGES["yt_transcribe_empty"])
+    yield gr.update(value=text.strip()), f"✓ 已转录 ({len(text.split())} 词)"
 
 
+@with_error_popup_yield
 def transcribe_audio(audio_path, language):
     """Standalone transcription handler."""
     if not audio_path:
-        gr.Warning("Upload or record audio first.")
-        return gr.update(), "No audio"
+        raise UserInputError(ERROR_MESSAGES["asr_empty"])
     lang = "auto" if language == "Auto" else language
-    yield gr.update(), "Loading ASR model..."
-    try:
-        text = engine.transcribe(audio_path, language=lang)
-        if not text or not text.strip():
-            yield gr.update(), "Transcription returned empty"
-            return
-        yield gr.update(value=text.strip()), f"Transcribed ({len(text.strip().split())} words)"
-    except Exception as e:
-        gr.Warning(f"Transcription failed: {e}")
-        yield gr.update(), f"Error: {e}"
+    yield gr.update(), "加载 ASR 模型中..."
+    text = engine.transcribe(audio_path, language=lang)
+    if not text or not text.strip():
+        raise UserInputError(ERROR_MESSAGES["asr_result_empty"])
+    yield gr.update(value=text.strip()), f"✓ 已转录 ({len(text.strip().split())} 词)"
 
 
 def save_transcript(text):
     """Save transcription text to .txt file."""
     if not text or not text.strip():
-        gr.Warning("No transcription to save.")
         return "Nothing to save"
     out_dir = app_settings["output_dir"]
     os.makedirs(out_dir, exist_ok=True)
@@ -453,10 +384,8 @@ def save_transcript(text):
 def _run_batch_custom_voice(text, speaker, language, instruct, split_mode, silence_ms, progress=gr.Progress()):
     segments = split_text(text, split_mode)
     if not segments:
-        gr.Warning("No text segments found.")
         return None, [["(empty)", "", ""]], "No segments"
     if len(segments) > MAX_BATCH_SEGMENTS:
-        gr.Warning(f"Too many segments ({len(segments)}). Max is {MAX_BATCH_SEGMENTS}.")
         return None, [["(error)", "", ""]], f"Too many segments (max {MAX_BATCH_SEGMENTS})"
 
     audio_parts = []
@@ -497,14 +426,11 @@ def _run_batch_custom_voice(text, speaker, language, instruct, split_mode, silen
 
 def _run_batch_voice_design(text, language, instruct, split_mode, silence_ms, progress=gr.Progress()):
     if not instruct.strip():
-        gr.Warning("Please describe the voice.")
         return None, [["(empty)", "", ""]], "Describe voice first"
     segments = split_text(text, split_mode)
     if not segments:
-        gr.Warning("No text segments found.")
         return None, [["(empty)", "", ""]], "No segments"
     if len(segments) > MAX_BATCH_SEGMENTS:
-        gr.Warning(f"Too many segments ({len(segments)}). Max is {MAX_BATCH_SEGMENTS}.")
         return None, [["(error)", "", ""]], f"Too many segments (max {MAX_BATCH_SEGMENTS})"
 
     audio_parts = []
@@ -549,21 +475,16 @@ def _run_batch_voice_clone(text, ref_audio, ref_text, language, library_voice, s
             ref_audio = library.get_ref_audio_path(library_voice)
             ref_text = voice["ref_text"]
         except FileNotFoundError:
-            gr.Warning(f"Voice '{library_voice}' not found.")
             return None, [["(error)", "", ""]], "Voice not found"
     if not ref_audio:
-        gr.Warning("No reference audio.")
         return None, [["(error)", "", ""]], "No reference audio"
     if not ref_text or not ref_text.strip():
-        gr.Warning("Reference transcript required.")
         return None, [["(error)", "", ""]], "No transcript"
 
     segments = split_text(text, split_mode)
     if not segments:
-        gr.Warning("No text segments found.")
         return None, [["(empty)", "", ""]], "No segments"
     if len(segments) > MAX_BATCH_SEGMENTS:
-        gr.Warning(f"Too many segments ({len(segments)}). Max is {MAX_BATCH_SEGMENTS}.")
         return None, [["(error)", "", ""]], f"Too many segments (max {MAX_BATCH_SEGMENTS})"
 
     audio_parts = []
@@ -610,13 +531,11 @@ def _run_batch_voice_clone(text, ref_audio, ref_text, language, library_voice, s
 def parse_script_handler(raw_text):
     """Parse script and return speaker info for voice assignment UI."""
     if not raw_text.strip():
-        gr.Warning("Enter a script first.")
         return gr.update(), "Enter a script first", {}
 
     parsed = parse_script(raw_text)
 
     if parsed.errors:
-        gr.Warning(parsed.errors[0])
         return gr.update(), "; ".join(parsed.errors), {}
 
     speaker_info = {
@@ -651,16 +570,13 @@ def generate_script_handler(raw_text, assignments_state, silence_ms, progress=gr
       {speaker: {"mode": ..., "speaker": ..., "language": ..., "instruct": ..., "library_voice": ...}}
     """
     if not raw_text.strip():
-        gr.Warning("Enter a script first.")
         return None, [["(empty)", "", "", ""]], "Enter script first"
 
     parsed = parse_script(raw_text)
     if parsed.errors:
-        gr.Warning(parsed.errors[0])
         return None, [["(error)", "", "", ""]], parsed.errors[0]
 
     if not assignments_state:
-        gr.Warning("Parse the script and assign voices first.")
         return None, [["(error)", "", "", ""]], "Parse script first"
 
     # Group lines by model type for efficient model swapping
@@ -781,64 +697,65 @@ def history_preview(entry_id):
         return None
     audio = history.get_audio(entry_id)
     if audio is None:
-        gr.Warning("Audio not found for this entry.")
         return None
     return audio
 
 
+@with_error_popup
 def history_delete(entry_id):
     """Delete a single history entry."""
     if not entry_id or entry_id == "(empty)":
-        return history.table_data(), "Select an entry first"
+        raise UserInputError(ERROR_MESSAGES["select_entry"])
     history.delete_entry(entry_id)
-    return history.table_data(), f"Deleted entry {entry_id}"
+    return history.table_data(), f"✓ 已删除 {entry_id}"
 
 
 def history_clear():
     """Clear all history."""
     history.clear()
-    return history.table_data(), "History cleared"
+    return history.table_data(), "✓ 历史记录已清空"
 
 
+@with_error_popup
 def history_save_audio(entry_id):
     """Save a history entry's audio to the output directory."""
     if not entry_id or entry_id == "(empty)":
-        return "Select an entry first"
+        raise UserInputError(ERROR_MESSAGES["select_entry"])
     audio = history.get_audio(entry_id)
     if audio is None:
-        return "Audio not found"
+        raise ResourceError("音频未找到")
     return save_audio(audio, "history")
 
 
+@with_error_popup
 def history_regenerate(entry_id):
     """Get params from a history entry for regeneration."""
     if not entry_id or entry_id == "(empty)":
-        return "Select an entry first"
+        raise UserInputError(ERROR_MESSAGES["select_entry"])
     entry = history.get_entry(entry_id)
     if entry is None:
-        return "Entry not found"
+        raise ResourceError("记录未找到")
     parts = [
-        f"Mode: {entry.mode.replace('_', ' ').title()}",
-        f"Language: {entry.language}",
+        f"模式: {entry.mode.replace('_', ' ').title()}",
+        f"语言: {entry.language}",
     ]
     if entry.speaker:
-        parts.append(f"Speaker: {entry.speaker}")
+        parts.append(f"说话人: {entry.speaker}")
     if entry.voice_params:
-        parts.append(f"Params: {entry.voice_params}")
-    parts.append(f"Text: {entry.text}")
+        parts.append(f"参数: {entry.voice_params}")
+    parts.append(f"文本: {entry.text}")
     return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
 # Save-to-library handlers
 # ---------------------------------------------------------------------------
+@with_error_popup
 def save_design_to_library(audio_tuple, name, language, description, spoken_text):
     if audio_tuple is None:
-        gr.Warning("Generate audio first before saving to library.")
-        return "No audio to save"
+        raise UserInputError(ERROR_MESSAGES["save_empty"])
     if not name.strip():
-        gr.Warning("Please enter a name for this voice.")
-        return "Enter a voice name"
+        raise UserInputError(ERROR_MESSAGES["import_empty_name"])
     sr, audio = audio_tuple
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     tmp_path = os.path.join(OUTPUT_DIR, f"_tmp_design_{int(time.time())}.wav")
@@ -852,19 +769,17 @@ def save_design_to_library(audio_tuple, name, language, description, spoken_text
         source="design",
     )
     os.remove(tmp_path)
-    return f"Voice '{name}' saved to library"
+    return f"✓ 音色 '{name}' 已保存到库"
 
 
+@with_error_popup
 def save_clone_to_library(ref_audio, ref_text, name, language):
     if not ref_audio:
-        gr.Warning("No reference audio to save.")
-        return "No reference audio"
+        raise UserInputError(ERROR_MESSAGES["import_empty_audio"])
     if not name.strip():
-        gr.Warning("Please enter a name for this voice.")
-        return "Enter a voice name"
+        raise UserInputError(ERROR_MESSAGES["import_empty_name"])
     if not ref_text or not ref_text.strip():
-        gr.Warning("Reference transcript is required.")
-        return "Enter transcript"
+        raise UserInputError(ERROR_MESSAGES["import_empty_transcript"])
     library.save_voice(
         name=name,
         ref_audio_path=ref_audio,
@@ -872,175 +787,160 @@ def save_clone_to_library(ref_audio, ref_text, name, language):
         language=language,
         source="clone",
     )
-    return f"Voice '{name}' saved to library"
+    return f"✓ 音色 '{name}' 已保存到库"
+
+
+@with_error_popup
+def import_voice(audio_path, transcript, name, language):
+    if not audio_path:
+        raise UserInputError(ERROR_MESSAGES["import_empty_audio"])
+    if not name.strip():
+        raise UserInputError(ERROR_MESSAGES["import_empty_name"])
+    if not transcript or not transcript.strip():
+        raise UserInputError(ERROR_MESSAGES["import_empty_transcript"])
+    library.save_voice(
+        name=name.strip(),
+        ref_audio_path=audio_path,
+        ref_text=transcript.strip(),
+        language=language,
+        description="Imported voice",
+        source="import",
+    )
+    return f"✓ 已导入 '{name.strip()}'"
 
 
 # ---------------------------------------------------------------------------
 # YT Voice Clone handlers
 # ---------------------------------------------------------------------------
+@with_error_popup
 def fetch_yt_info(url):
     if not url or not url.strip():
-        return gr.update(), "_Enter a URL above._", {}, "Enter a YouTube URL"
-    try:
-        info = yt_extractor.fetch_info(url.strip())
-        dur = info.get("duration") or 0
-        h, rem = divmod(int(dur), 3600)
-        m, s = divmod(rem, 60)
-        dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
-        if info.get("has_manual_subs"):
-            sub_note = "Manual subtitles"
-        elif info.get("has_auto_subs"):
-            sub_note = "Auto-generated subtitles (may need editing)"
-        else:
-            sub_note = "No subtitles — enter transcript manually"
-        md = (
-            f"**{info['title']}**\n\n"
-            f"Duration: {dur_str}  |  {sub_note}"
-            + (f"\n\nChannel: {info['uploader']}" if info.get("uploader") else "")
-        )
-        state = {
-            "id": info["id"],
-            "title": info["title"],
-            "duration": dur,
-            "language": info.get("language"),
-        }
-        return (
-            gr.update(value=info.get("thumbnail") or None),
-            md,
-            state,
-            f"✓ Fetched: {info['title'][:60]}",
-        )
-    except (ValueError, RuntimeError) as e:
-        gr.Warning(str(e))
-        return gr.update(), f"**Error:** {e}", {}, str(e)
-    except Exception as e:
-        gr.Warning(f"Failed to fetch video info: {e}")
-        return gr.update(), f"**Error:** {e}", {}, f"Error: {e}"
+        raise UserInputError(ERROR_MESSAGES["yt_url_empty"])
+    info = yt_extractor.fetch_info(url.strip())
+    dur = info.get("duration") or 0
+    h, rem = divmod(int(dur), 3600)
+    m, s = divmod(rem, 60)
+    dur_str = f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+    if info.get("has_manual_subs"):
+        sub_note = "手动字幕"
+    elif info.get("has_auto_subs"):
+        sub_note = "自动字幕（可能需要编辑）"
+    else:
+        sub_note = "无字幕 — 需手动输入转录文本"
+    md = (
+        f"**{info['title']}**\n\n"
+        f"时长: {dur_str}  |  {sub_note}"
+        + (f"\n\n频道: {info['uploader']}" if info.get("uploader") else "")
+    )
+    state = {
+        "id": info["id"],
+        "title": info["title"],
+        "duration": dur,
+        "language": info.get("language"),
+    }
+    return (
+        gr.update(value=info.get("thumbnail") or None),
+        md,
+        state,
+        f"✓ 获取成功: {info['title'][:60]}",
+    )
 
 
+@with_error_popup
 def extract_yt_clip(url, start_str, end_str, video_state, progress=gr.Progress()):
     if not url or not url.strip():
-        return gr.update(), gr.update(), "Enter a YouTube URL first"
+        raise UserInputError(ERROR_MESSAGES["yt_url_empty"])
     if not video_state or not video_state.get("id"):
-        return gr.update(), gr.update(), "Fetch video info first (Step 1)"
+        raise UserInputError(ERROR_MESSAGES["yt_fetch_first"])
 
     vid_dur = video_state.get("duration")
 
-    # Resolve start — blank defaults to beginning of video
-    try:
-        start_sec = yt_extractor.parse_timestamp(start_str or "0")
-    except ValueError as e:
-        gr.Warning(str(e))
-        return gr.update(), gr.update(), f"Bad start time: {e}"
+    start_sec = yt_extractor.parse_timestamp(start_str or "0")
 
-    # Resolve end — blank defaults to video duration (or full video)
     if not end_str or not end_str.strip():
         if not vid_dur:
-            gr.Warning("Enter an end time — video duration unknown.")
-            return gr.update(), gr.update(), "Enter an end time"
+            raise UserInputError("请输入结束时间")
         end_sec = float(vid_dur)
     else:
-        try:
-            end_sec = yt_extractor.parse_timestamp(end_str)
-        except ValueError:
-            gr.Warning("Invalid end time — use mm:ss")
-            return gr.update(), gr.update(), "Enter a valid end time"
+        end_sec = yt_extractor.parse_timestamp(end_str)
 
     if end_sec <= start_sec:
-        gr.Warning("End time must be after start time.")
-        return gr.update(), gr.update(), "End must be after start"
+        raise UserInputError(ERROR_MESSAGES["yt_end_before_start"])
 
     clip_dur = end_sec - start_sec
     if clip_dur < 3.0:
-        gr.Warning("Clip must be at least 3 seconds.")
-        return gr.update(), gr.update(), "Clip too short (min 3 s)"
+        raise UserInputError(ERROR_MESSAGES["yt_clip_short"])
     if clip_dur > 60.0:
-        gr.Warning("Clip capped at 60 seconds.")
         end_sec = start_sec + 60.0
         clip_dur = 60.0
-    elif clip_dur > 30.0:
-        gr.Warning(f"Clip is {clip_dur:.0f}s — 5-20 s gives best clone quality.")
 
     if vid_dur and end_sec > vid_dur + 1:
-        gr.Warning(f"End time exceeds video duration ({vid_dur:.0f}s).")
-        return gr.update(), gr.update(), "End time beyond video end"
+        raise UserInputError(ERROR_MESSAGES["yt_time_exceeds"])
 
     video_id = video_state["id"]
 
-    try:
-        progress(0.0, desc="Starting…")
-        wav_path, subs_ok = yt_extractor.download_clip(
-            url.strip(), video_id, start_sec, end_sec,
-            progress_cb=lambda f, d: progress(f, desc=d),
-        )
-        progress(0.90, desc="Extracting transcript…")
-        transcript = yt_extractor.extract_transcript(video_id, start_sec, end_sec)
-        progress(1.0, desc="Done")
+    progress(0.0, desc="开始下载...")
+    wav_path, subs_ok = yt_extractor.download_clip(
+        url.strip(), video_id, start_sec, end_sec,
+        progress_cb=lambda f, d: progress(f, desc=d),
+    )
+    progress(0.90, desc="提取转录文本...")
+    transcript = yt_extractor.extract_transcript(video_id, start_sec, end_sec)
+    progress(1.0, desc="完成")
 
-        note = "transcript auto-filled" if transcript else "no subtitles — enter transcript manually"
-        return (
-            gr.update(value=wav_path),
-            gr.update(value=transcript),
-            f"✓ {clip_dur:.1f}s clip extracted — {note}",
-        )
-    except Exception as e:
-        gr.Warning(f"Extraction failed: {e}")
-        return gr.update(), gr.update(), f"Error: {e}"
+    note = "转录文本已自动填充" if transcript else "无字幕 — 请手动输入转录文本"
+    return (
+        gr.update(value=wav_path),
+        gr.update(value=transcript),
+        f"✓ {clip_dur:.1f}s 片段已提取 — {note}",
+    )
 
 
+@with_error_popup
 def clone_yt_voice(text, ref_audio, transcript, language, voice_name):
     errors = []
     if not text or not text.strip():
-        errors.append("text to synthesize")
+        errors.append("合成文本")
     if not ref_audio:
-        errors.append("reference clip (extract one first)")
+        errors.append("参考片段（先提取）")
     if not transcript or not transcript.strip():
-        errors.append("reference transcript")
+        errors.append("参考转录文本")
     if not voice_name or not voice_name.strip():
-        errors.append("voice name")
+        errors.append("音色名称")
     if errors:
-        msg = "Required: " + ", ".join(errors)
-        gr.Warning(msg)
-        return gr.update(), msg, msg, gr.update(), gr.update()
+        raise UserInputError(ERROR_MESSAGES["clone_missing_fields"].format(fields=", ".join(errors)))
 
-    try:
-        t0 = time.time()
-        result = generate_with_timeout(
-            engine.generate_voice_clone,
-            text.strip(), ref_audio, transcript.strip(), language,
-            denoise_ref=app_settings["denoise_ref"],
-            timeout_seconds=app_settings["timeout"],
-            **_gen_kwargs(),
-        )
-        elapsed = time.time() - t0
-        lib_msg = save_clone_to_library(
-            ref_audio, transcript.strip(), voice_name.strip(), language
-        )
-        history.add(
-            mode="voice_clone",
-            text=text.strip(),
-            language=language,
-            audio=result,
-            voice_params=f"yt: {voice_name.strip()}",
-        )
-        extra = ""
-        if app_settings["autosave"]:
-            extra = " | " + save_audio(result, "yt_clone")
-        denoise_msg = " | Noise reduction applied" if app_settings["denoise_ref"] else ""
-        status_msg = f"Generated in {elapsed:.1f}s | {lib_msg}{denoise_msg}{extra}"
-        return (
-            gr.update(value=result),
-            status_msg,
-            f"✓ {lib_msg}",
-            gr.update(choices=_voice_choices()),
-            gr.update(value=_voice_table()),
-        )
-    except GenerationTimeout as e:
-        gr.Warning(str(e))
-        return gr.update(), str(e), str(e), gr.update(), gr.update()
-    except Exception as e:
-        gr.Warning(f"Generation failed: {e}")
-        return gr.update(), f"Error: {e}", f"Error: {e}", gr.update(), gr.update()
+    t0 = time.time()
+    result = generate_with_timeout(
+        engine.generate_voice_clone,
+        text.strip(), ref_audio, transcript.strip(), language,
+        denoise_ref=app_settings["denoise_ref"],
+        timeout_seconds=app_settings["timeout"],
+        **_gen_kwargs(),
+    )
+    elapsed = time.time() - t0
+    lib_msg = save_clone_to_library(
+        ref_audio, transcript.strip(), voice_name.strip(), language
+    )
+    history.add(
+        mode="voice_clone",
+        text=text.strip(),
+        language=language,
+        audio=result,
+        voice_params=f"yt: {voice_name.strip()}",
+    )
+    extra = ""
+    if app_settings["autosave"]:
+        extra = " | " + save_audio(result, "yt_clone")
+    denoise_msg = " | 已降噪" if app_settings["denoise_ref"] else ""
+    status_msg = f"✓ 完成 {elapsed:.1f}s | {lib_msg}{denoise_msg}{extra}"
+    return (
+        gr.update(value=result),
+        status_msg,
+        f"✓ {lib_msg}",
+        gr.update(choices=_voice_choices()),
+        gr.update(value=_voice_table()),
+    )
 
 
 def clear_yt_cache():
@@ -1063,44 +963,25 @@ def preview_voice(voice_name):
     return None
 
 
+@with_error_popup
 def delete_voice(voice_name):
     if not voice_name or voice_name == "(empty)":
-        return _voice_table(), "Select a voice first"
+        raise UserInputError(ERROR_MESSAGES["select_voice"])
     if not library.delete_voice(voice_name):
-        return _voice_table(), f"Voice '{voice_name}' not found"
-    return _voice_table(), f"Deleted '{voice_name}'"
+        raise ResourceError(ERROR_MESSAGES["voice_not_found"].format(name=voice_name))
+    return _voice_table(), f"✓ 已删除 '{voice_name}'"
 
 
+@with_error_popup
 def rename_voice(old_name, new_name):
     if not old_name or old_name == "(empty)":
-        return _voice_table(), "Select a voice first"
+        raise UserInputError(ERROR_MESSAGES["select_voice"])
     if not new_name.strip():
-        return _voice_table(), "Enter a new name"
+        raise UserInputError(ERROR_MESSAGES["rename_empty"])
     ok = library.rename_voice(old_name, new_name.strip())
-    if ok:
-        return _voice_table(), f"Renamed '{old_name}' to '{new_name.strip()}'"
-    return _voice_table(), f"Rename failed (name may already exist)"
-
-
-def import_voice(audio_path, transcript, name, language):
-    if not audio_path:
-        gr.Warning("Upload audio to import.")
-        return _voice_table(), "Upload audio first"
-    if not name.strip():
-        gr.Warning("Enter a name for the imported voice.")
-        return _voice_table(), "Enter a name"
-    if not transcript or not transcript.strip():
-        gr.Warning("Transcript required for imported voice.")
-        return _voice_table(), "Enter transcript"
-    library.save_voice(
-        name=name.strip(),
-        ref_audio_path=audio_path,
-        ref_text=transcript.strip(),
-        language=language,
-        description="Imported voice",
-        source="import",
-    )
-    return _voice_table(), f"Imported '{name.strip()}'"
+    if not ok:
+        raise ResourceError("重命名失败（名称可能已存在）")
+    return _voice_table(), f"✓ 已重命名 '{old_name}' → '{new_name.strip()}'"
 
 
 # ---------------------------------------------------------------------------
@@ -1194,22 +1075,23 @@ def unload_asr_setting():
 
 
 def delete_cached_models():
-    """Delete all Qwen3-TTS model files from the HuggingFace cache."""
+    """Delete all Qwen3-TTS model files from the ModelScope cache."""
     engine.unload_model()
-    hf_cache = _get_hf_cache_dir()
-    if not os.path.isdir(hf_cache):
-        return "HuggingFace cache directory not found", "No model loaded"
+    from config import MODELSCOPE_CACHE_ROOT
+    ms_cache = MODELSCOPE_CACHE_ROOT
+    if not os.path.isdir(ms_cache):
+        return "ModelScope cache directory not found", "No model loaded"
     deleted = []
     failed = []
-    for entry in os.listdir(hf_cache):
-        if entry.startswith("models--mlx-community--Qwen3-TTS-12Hz-"):
-            path = os.path.join(hf_cache, entry)
+    for entry in os.listdir(ms_cache):
+        if entry.startswith("Qwen3-TTS-12Hz-"):
+            path = os.path.join(ms_cache, entry)
             if os.path.isdir(path):
                 try:
                     shutil.rmtree(path)
-                    deleted.append(entry.replace("models--mlx-community--", ""))
+                    deleted.append(entry)
                 except OSError as e:
-                    failed.append(f"{entry.replace('models--mlx-community--', '')}: {e}")
+                    failed.append(f"{entry}: {e}")
     parts = []
     if deleted:
         parts.append(f"Deleted {len(deleted)} model(s): {', '.join(deleted)}")
@@ -1291,12 +1173,12 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                             label="Batch Results",
                             interactive=False,
                         )
-                        cv_batch_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False, buttons=["download"])
+                        cv_batch_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False)
                         with gr.Row():
                             cv_batch_save = gr.Button("Save Combined Audio")
                             cv_batch_status = gr.Textbox(label="Batch Status", interactive=False)
                 with gr.Column(scale=1, elem_classes=["output-col"]):
-                    cv_audio = gr.Audio(label="Output", type="numpy", interactive=False, buttons=["download"])
+                    cv_audio = gr.Audio(label="Output", type="numpy", interactive=False)
                     cv_save = gr.Button("Save Audio")
                     cv_save_status = gr.Textbox(
                         show_label=False, interactive=False,
@@ -1358,12 +1240,12 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                             label="Batch Results",
                             interactive=False,
                         )
-                        vd_batch_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False, buttons=["download"])
+                        vd_batch_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False)
                         with gr.Row():
                             vd_batch_save = gr.Button("Save Combined Audio")
                             vd_batch_status = gr.Textbox(label="Batch Status", interactive=False)
                 with gr.Column(scale=1, elem_classes=["output-col"]):
-                    vd_audio = gr.Audio(label="Output", type="numpy", interactive=False, buttons=["download"])
+                    vd_audio = gr.Audio(label="Output", type="numpy", interactive=False)
                     vd_save = gr.Button("Save Audio")
                     vd_save_status = gr.Textbox(
                         show_label=False, interactive=False,
@@ -1396,7 +1278,6 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                         label="Reference Audio",
                         type="filepath",
                         sources=["upload", "microphone"],
-                        buttons=["download"],
                     )
                     with gr.Row():
                         vc_transcribe_btn = gr.Button("Transcribe Reference", variant="secondary", scale=1)
@@ -1442,12 +1323,12 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                             label="Batch Results",
                             interactive=False,
                         )
-                        vc_batch_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False, buttons=["download"])
+                        vc_batch_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False)
                         with gr.Row():
                             vc_batch_save = gr.Button("Save Combined Audio")
                             vc_batch_status = gr.Textbox(label="Batch Status", interactive=False)
                 with gr.Column(scale=1, elem_classes=["output-col"]):
-                    vc_audio = gr.Audio(label="Output", type="numpy", interactive=False, buttons=["download"])
+                    vc_audio = gr.Audio(label="Output", type="numpy", interactive=False)
                     vc_save = gr.Button("Save Audio")
                     vc_save_status = gr.Textbox(
                         show_label=False, interactive=False,
@@ -1527,10 +1408,9 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                         label="Reference Clip Preview",
                         type="filepath",
                         interactive=False,
-                        buttons=["download"],
                     )
                     yt_audio_out = gr.Audio(
-                        label="Generated Audio", type="numpy", interactive=False, buttons=["download"]
+                        label="Generated Audio", type="numpy", interactive=False
                     )
                     yt_status = gr.Textbox(
                         label="Status", interactive=False, elem_classes=["save-status-text"]
@@ -1621,7 +1501,7 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                         sm_save_btn = gr.Button("Save Combined Audio")
 
                 with gr.Column(scale=1):
-                    sm_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False, buttons=["download"])
+                    sm_audio = gr.Audio(label="Combined Output", type="numpy", interactive=False)
                     sm_table = gr.Dataframe(
                         headers=["Line", "Speaker", "Text", "Status"],
                         value=[["", "", "", ""]],
@@ -1684,7 +1564,6 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                         value=_voice_table(),
                         label="Saved Voices",
                         interactive=False,
-                        max_height=300,
                     )
                     with gr.Row():
                         lib_selected = gr.Textbox(
@@ -1699,7 +1578,7 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                             label="Rename To", placeholder="new_name", scale=2
                         )
                         lib_rename_btn = gr.Button("Rename", scale=1)
-                    lib_preview_audio = gr.Audio(label="Reference Audio Preview", buttons=["download"])
+                    lib_preview_audio = gr.Audio(label="Reference Audio Preview")
                     lib_status = gr.Textbox(
                         show_label=False, interactive=False,
                         placeholder="Status…",
@@ -1708,7 +1587,7 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                 with gr.Column(scale=1, elem_classes=["output-col"]):
                     gr.Markdown("### Import Voice")
                     lib_import_audio = gr.Audio(
-                        label="Audio File", type="filepath", buttons=["download"]
+                        label="Audio File", type="filepath"
                     )
                     lib_import_transcript = gr.Textbox(
                         label="Transcript", lines=3
@@ -1731,7 +1610,6 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                 label="Generation History",
                 interactive=False,
                 elem_classes=["history-table"],
-                max_height=360,
             )
             with gr.Row():
                 hist_selected = gr.Textbox(
@@ -1752,7 +1630,7 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
             )
             with gr.Row():
                 hist_audio = gr.Audio(
-                    label="Audio Preview", type="numpy", interactive=False, scale=1, buttons=["download"]
+                    label="Audio Preview", type="numpy", interactive=False, scale=1
                 )
                 hist_regen_info = gr.Textbox(
                     label="Regeneration Params", interactive=False, lines=3, scale=1
@@ -1803,7 +1681,7 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                     with gr.Accordion("Model Cache & ASR", open=False, elem_classes=["settings-accordion"]):
                         gr.Markdown("### Model Cache")
                         gr.Textbox(
-                            label="HuggingFace Cache Directory",
+                            label="ModelScope Cache Directory",
                             value=os.path.abspath(_get_hf_cache_dir()),
                             interactive=False,
                             elem_classes=["model-status"],
@@ -2080,14 +1958,12 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
     def _parse_and_update_slots(raw_text):
         """Parse script and update speaker slot visibility."""
         if not raw_text.strip():
-            gr.Warning("Enter a script first.")
             updates = [gr.update(visible=False) for _ in range(MAX_SCRIPT_SPEAKERS)]
             return *updates, "Enter a script first", {}
 
         parsed = parse_script(raw_text)
 
         if parsed.errors:
-            gr.Warning(parsed.errors[0])
             updates = [gr.update(visible=False) for _ in range(MAX_SCRIPT_SPEAKERS)]
             return *updates, "; ".join(parsed.errors), {}
 
@@ -2193,15 +2069,15 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
         outputs=[sm_status],
     )
 
-    # Refresh library voice dropdowns in all speaker slots when the tab is selected
-    def _refresh_script_lib_voices():
-        choices = _voice_choices()
-        return [gr.update(choices=choices) for _ in range(MAX_SCRIPT_SPEAKERS)]
+    # Refresh library voice dropdowns in script mode on focus
+    def _refresh_single_lib_voice():
+        return gr.update(choices=_voice_choices())
 
-    script_tab.select(
-        fn=_refresh_script_lib_voices,
-        outputs=sm_speaker_lib_voices,
-    )
+    for lib_voice_dropdown in sm_speaker_lib_voices:
+        lib_voice_dropdown.focus(
+            fn=_refresh_single_lib_voice,
+            outputs=[lib_voice_dropdown],
+        )
 
     # --- Voice Library ---
     lib_preview_btn.click(

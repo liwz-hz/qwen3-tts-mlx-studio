@@ -1,9 +1,16 @@
+import os
+
 # Model defaults
 DEFAULT_MODEL_SIZE = "1.7B"
-DEFAULT_QUANTIZATION = "bf16"
+DEFAULT_QUANTIZATION = "8bit"
 
-# HuggingFace repo template
-REPO_TEMPLATE = "mlx-community/Qwen3-TTS-12Hz-{size}-{variant}-{quant}"
+# ModelScope local cache path
+MODELSCOPE_CACHE_ROOT = os.path.join(
+    os.path.expanduser("~"), ".cache", "modelscope", "hub", "models", "mlx-community"
+)
+
+# Model repo template — used for display and cache checking
+REPO_TEMPLATE = "Qwen3-TTS-12Hz-{size}-{variant}-{quant}"
 
 # Model variant mapping
 MODEL_VARIANTS = {

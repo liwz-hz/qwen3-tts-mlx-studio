@@ -14,20 +14,34 @@ C_TEXT="189"     # #c0caf5 — primary text
 C_MUTED="60"     # #565f89 — muted text
 C_BORDER="60"    # #3b4261 — borders
 
-# ── Bootstrap Gum ────────────────────────────────────────────────────────────
-if ! command -v gum &>/dev/null; then
-    if [[ -x ".gum_bin/gum" ]]; then
-        export PATH="$PWD/.gum_bin:$PATH"
-    elif command -v brew &>/dev/null; then
-        echo "Installing gum via Homebrew..."
-        brew install gum --quiet
-    else
-        echo "Downloading gum binary..."
-        mkdir -p .gum_bin
-        curl -fsSL "https://github.com/charmbracelet/gum/releases/download/v0.16.0/gum_0.16.0_Darwin_arm64.tar.gz" \
-            | tar xz -C .gum_bin gum
-        export PATH="$PWD/.gum_bin:$PATH"
+# ── Bootstrap Gum (skip if Homebrew broken) ──────────────────────────────────
+GUM_OK=0
+if command -v gum &>/dev/null; then
+    GUM_OK=1
+elif [[ -x ".gum_bin/gum" ]]; then
+    export PATH="$PWD/.gum_bin:$PATH"
+    GUM_OK=1
+elif command -v brew &>/dev/null; then
+    export HOMEBREW_API_DOMAIN="https://mirrors.aliyun.com/homebrew/brew-api"
+    export HOMEBREW_BOTTLE_DOMAIN="https://mirrors.aliyun.com/homebrew/homebrew-bottles"
+    export HOMEBREW_NO_AUTO_UPDATE=1
+    export HOMEBREW_NO_INSTALL_UPGRADE=1
+    if timeout 15 brew install gum --quiet 2>/dev/null; then
+        GUM_OK=1
     fi
+fi
+
+if [[ "$GUM_OK" -ne 1 ]]; then
+    gum() {
+        local last=""
+        for arg in "$@"; do
+            case "$arg" in
+                --*) ;;
+                *) last="$arg" ;;
+            esac
+        done
+        echo "$last"
+    }
 fi
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -35,23 +49,6 @@ ok()   { gum style --foreground "$C_GREEN"  "  [OK]  $1"; }
 warn() { gum style --foreground "$C_ORANGE" "  [!!]  $1"; }
 fail() { gum style --foreground "$C_RED"    "  [ERR] $1"; exit 1; }
 info() { gum style --foreground "$C_BLUE" --bold "  >>>   $1"; }
-
-# Returns 0 and prints "MAJOR.MINOR" if the given python binary is 3.10–3.13
-check_python_compat() {
-    local py_bin="$1"
-    if [[ ! -x "$py_bin" ]] && ! command -v "$py_bin" &>/dev/null; then
-        return 1
-    fi
-    local ver major minor
-    ver=$("$py_bin" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null) || return 1
-    major=$(echo "$ver" | cut -d. -f1)
-    minor=$(echo "$ver" | cut -d. -f2)
-    if [[ "$major" -eq 3 && "$minor" -ge 10 && "$minor" -le 13 ]]; then
-        echo "$ver"
-        return 0
-    fi
-    return 1
-}
 
 # ── Header banner ────────────────────────────────────────────────────────────
 echo ""
@@ -73,83 +70,18 @@ if [[ "$ARCH" != "arm64" ]]; then
 fi
 ok "macOS on Apple Silicon ($ARCH)"
 
-# ── Preflight: Resolve compatible Python (3.10–3.13) ────────────────────────
-info "Checking for compatible Python (3.10–3.13)..."
+# ── Preflight: Conda ─────────────────────────────────────────────────────────
+info "Checking conda installation..."
 
-PYTHON_CMD=""
-PY_VERSION=""
-
-# Step 1: Try system python3
-if ver=$(check_python_compat python3); then
-    PYTHON_CMD="python3"
-    PY_VERSION="$ver"
+if ! command -v conda &>/dev/null; then
+    echo ""
+    gum style --foreground "$C_TEXT" "   Conda (Miniconda/Anaconda) is required to manage the Python environment."
+    echo ""
+    gum style --foreground "$C_TEXT" "   Install Miniconda from: https://docs.conda.io/en/latest/miniconda.html"
+    echo ""
+    fail "Conda not found on PATH."
 fi
-
-# Step 2: Try versioned binaries on PATH (prefer 3.12 for best wheel support)
-if [[ -z "$PYTHON_CMD" ]]; then
-    for minor in 12 13 11 10; do
-        if ver=$(check_python_compat "python3.${minor}"); then
-            PYTHON_CMD="python3.${minor}"
-            PY_VERSION="$ver"
-            break
-        fi
-    done
-fi
-
-# Step 3: Try Homebrew prefix explicitly (handles PATH not including brew bin)
-if [[ -z "$PYTHON_CMD" ]] && command -v brew &>/dev/null; then
-    BREW_PREFIX="$(brew --prefix)"
-    for minor in 12 13 11 10; do
-        local_bin="${BREW_PREFIX}/bin/python3.${minor}"
-        if ver=$(check_python_compat "$local_bin"); then
-            PYTHON_CMD="$local_bin"
-            PY_VERSION="$ver"
-            break
-        fi
-    done
-fi
-
-# Step 4: Offer to brew install python@3.12
-if [[ -z "$PYTHON_CMD" ]]; then
-    if command -v python3 &>/dev/null; then
-        sys_ver=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "unknown")
-        warn "System python3 is $sys_ver — outside compatible range (3.10–3.13)."
-    else
-        warn "No python3 found on PATH."
-    fi
-
-    if command -v brew &>/dev/null; then
-        echo ""
-        gum style --foreground "$C_TEXT" "   Python 3.12 is recommended (best compatibility with MLX ecosystem)."
-        if gum confirm "Install python@3.12 via Homebrew?"; then
-            info "Installing python@3.12 via Homebrew..."
-            gum spin --spinner dot --title "Installing python@3.12..." \
-                --spinner.foreground "$C_BLUE" -- brew install python@3.12
-            BREW_PREFIX="$(brew --prefix)"
-            PYTHON_CMD="${BREW_PREFIX}/bin/python3.12"
-            if ver=$(check_python_compat "$PYTHON_CMD"); then
-                PY_VERSION="$ver"
-            else
-                fail "Homebrew installed python@3.12 but it failed validation."
-            fi
-        else
-            fail "No compatible Python available. Install manually: brew install python@3.12"
-        fi
-    else
-        echo ""
-        gum style --foreground "$C_TEXT" "   No compatible Python found and Homebrew is not installed."
-        echo ""
-        gum style --foreground "$C_TEXT" "   Option 1: Install Homebrew (https://brew.sh), then:"
-        gum style --foreground "$C_TEXT" "             brew install python@3.12"
-        echo ""
-        gum style --foreground "$C_TEXT" "   Option 2: Download Python 3.12 from:"
-        gum style --foreground "$C_TEXT" "             https://www.python.org/downloads/"
-        echo ""
-        fail "Cannot continue without Python 3.10–3.13."
-    fi
-fi
-
-ok "Using Python $PY_VERSION ($PYTHON_CMD)"
+ok "Conda found: $(conda --version)"
 
 # ── Preflight: ffmpeg ─────────────────────────────────────────────────────────
 if command -v ffmpeg &>/dev/null; then
@@ -175,32 +107,23 @@ else
     fi
 fi
 
-# ── Create virtual environment ────────────────────────────────────────────────
-info "Setting up Python virtual environment..."
+# ── Create/activate conda environment ─────────────────────────────────────────
+info "Setting up conda environment 'audio'..."
 
-if [[ -d ".venv" ]]; then
-    # Verify existing venv uses a compatible Python
-    if ver=$(check_python_compat .venv/bin/python3); then
-        ok "Virtual environment already exists (.venv/) — Python $ver"
-    else
-        VENV_PY_VER=$(.venv/bin/python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || echo "unknown")
-        warn "Existing .venv uses Python $VENV_PY_VER (incompatible). Recreating..."
-        rm -rf .venv
-        "$PYTHON_CMD" -m venv .venv
-        ok "Recreated virtual environment with Python $PY_VERSION"
-    fi
+if conda env list 2>/dev/null | grep -q "^audio"; then
+    ok "Conda environment 'audio' already exists"
 else
-    "$PYTHON_CMD" -m venv .venv
-    ok "Created virtual environment (.venv/)"
+    gum spin --spinner dot --title "Creating conda environment 'audio' (Python 3.12)..." \
+        --spinner.foreground "$C_BLUE" -- conda create -n audio python=3.12 -y
+    ok "Created conda environment 'audio'"
 fi
 
-source .venv/bin/activate
+eval "$(conda shell.bash hook)"
+conda activate audio
 
 # ── Install dependencies ──────────────────────────────────────────────────────
 info "Installing Python packages (this may take a few minutes)..."
 
-gum spin --spinner dot --title "Upgrading pip..." \
-    --spinner.foreground "$C_BLUE" -- pip install --upgrade pip -q
 gum spin --spinner dot --title "Installing Python packages..." \
     --spinner.foreground "$C_BLUE" -- pip install -U -r requirements.txt -q
 
@@ -210,36 +133,56 @@ ok "All packages installed"
 mkdir -p outputs/history voices
 ok "Created output directories"
 
-# ── Optional: Pre-download models ─────────────────────────────────────────────
-echo ""
-info "Model download (optional)"
-gum style --foreground "$C_TEXT" "   The TTS models can be downloaded now, or they'll"
-gum style --foreground "$C_TEXT" "   download automatically when you first use each voice mode."
-echo ""
-
-if gum confirm --default=no "Download models now?"; then
-    info "Select quantization (bf16 is default, 4bit is smallest):"
-    QUANT=$(gum choose --selected="bf16" "bf16" "8bit" "6bit" "4bit")
-    info "Downloading ${QUANT} models..."
-    pip install -q huggingface_hub
-
-    gum spin --spinner dot --title "[1/3] Downloading CustomVoice model (${QUANT})..." \
-        --spinner.foreground "$C_BLUE" -- \
-        huggingface-cli download "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-${QUANT}" --quiet
-    ok "CustomVoice model downloaded"
-
-    gum spin --spinner dot --title "[2/3] Downloading VoiceDesign model (${QUANT})..." \
-        --spinner.foreground "$C_BLUE" -- \
-        huggingface-cli download "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-${QUANT}" --quiet
-    ok "VoiceDesign model downloaded"
-
-    gum spin --spinner dot --title "[3/3] Downloading Base model (${QUANT})..." \
-        --spinner.foreground "$C_BLUE" -- \
-        huggingface-cli download "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-${QUANT}" --quiet
-    ok "Base model downloaded"
-else
-    ok "Skipped — models will download on first use"
-fi
+# ── Model download (DISABLED — use ModelScope local cache) ────────────────────
+#
+# 模型预下载已禁用。请使用 ModelScope 下载模型：
+#
+#   方法 1: pip 安装 modelscope 后使用 CLI
+#     pip install modelscope
+#     modelscope download mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit
+#
+#   方法 2: Python 代码下载
+#     from modelscope.hub.snapshot_download import snapshot_download
+#     snapshot_download("mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit")
+#
+#   模型列表:
+#     - mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-{bf16|8bit|6bit|4bit}
+#     - mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-{bf16|8bit|6bit|4bit}
+#     - mlx-community/Qwen3-TTS-12Hz-1.7B-Base-{bf16|8bit|6bit|4bit}
+#
+#   模型将下载到: ~/.cache/modelscope/hub/models/mlx-community/
+#
+# 以下为原 HuggingFace 预下载代码（已注释）:
+#
+# echo ""
+# info "Model download (optional)"
+# gum style --foreground "$C_TEXT" "   The TTS models can be downloaded now, or they'll"
+# gum style --foreground "$C_TEXT" "   download automatically when you first use each voice mode."
+# echo ""
+#
+# if gum confirm --default=no "Download models now?"; then
+#     info "Select quantization (bf16 is default, 4bit is smallest):"
+#     QUANT=$(gum choose --selected="bf16" "bf16" "8bit" "6bit" "4bit")
+#     info "Downloading ${QUANT} models..."
+#     pip install -q huggingface_hub
+#
+#     gum spin --spinner dot --title "[1/3] Downloading CustomVoice model (${QUANT})..." \
+#         --spinner.foreground "$C_BLUE" -- \
+#         huggingface-cli download "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-${QUANT}" --quiet
+#     ok "CustomVoice model downloaded"
+#
+#     gum spin --spinner dot --title "[2/3] Downloading VoiceDesign model (${QUANT})..." \
+#         --spinner.foreground "$C_BLUE" -- \
+#         huggingface-cli download "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-${QUANT}" --quiet
+#     ok "VoiceDesign model downloaded"
+#
+#     gum spin --spinner dot --title "[3/3] Downloading Base model (${QUANT})..." \
+#         --spinner.foreground "$C_BLUE" -- \
+#         huggingface-cli download "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-${QUANT}" --quiet
+#     ok "Base model downloaded"
+# else
+#     ok "Skipped — models will download on first use"
+# fi
 
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""

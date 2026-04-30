@@ -136,6 +136,82 @@ textarea, input[type="text"] { background-color: #24283b !important; color: #c0c
 
 /* Text length hint below text boxes */
 .text-hint p { color: #565f89 !important; font-size: 0.8em !important; margin: 2px 0 4px !important; }
+
+/* ===== Error popup styling (gr.Error) ===== */
+.gradio-container .error {
+    background-color: rgba(247, 118, 142, 0.15) !important;
+    border: 1px solid rgba(247, 118, 142, 0.3) !important;
+    border-left: 4px solid #f7768e !important;
+    border-radius: 8px !important;
+    color: #f7768e !important;
+    font-weight: 500 !important;
+    padding: 12px 16px !important;
+    margin: 12px 0 !important;
+    animation: slideIn 0.3s ease-out !important;
+}
+
+/* Error popup animation */
+@keyframes slideIn {
+    from {
+        transform: translateY(-10px);
+        opacity: 0;
+    }
+    to {
+        transform: translateY(0);
+        opacity: 1;
+    }
+}
+
+/* Close button for error popup */
+.gradio-container .error .close {
+    color: #f7768e !important;
+    opacity: 0.7 !important;
+    cursor: pointer !important;
+    transition: opacity 0.2s !important;
+}
+.gradio-container .error .close:hover {
+    opacity: 1 !important;
+}
+
+/* ===== Success message styling ===== */
+.status-success-text {
+    background: rgba(158, 206, 106, 0.08) !important;
+    border-left: 3px solid #9ece6a !important;
+    color: #9ece6a !important;
+}
+
+/* ===== Warning message styling ===== */
+.status-warning-text {
+    background: rgba(255, 158, 100, 0.08) !important;
+    border-left: 3px solid #ff9e64 !important;
+    color: #ff9e64 !important;
+}
+
+/* ===== Enhanced progress bar ===== */
+.progress-bar {
+    background-color: #3b4261 !important;
+}
+.progress-bar-inner {
+    background-color: #7aa2f7 !important;
+    transition: width 0.3s ease !important;
+}
+
+/* ===== Button hover effects ===== */
+.primary:hover {
+    background-color: #6690e6 !important;
+    transition: background-color 0.2s !important;
+}
+
+button:not(.primary):hover {
+    border-color: #7aa2f7 !important;
+    transition: border-color 0.2s !important;
+}
+
+/* ===== Loading indicator ===== */
+.loading-indicator {
+    color: #7aa2f7 !important;
+    font-size: 0.85em !important;
+}
 """
 
 

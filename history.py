@@ -1,5 +1,7 @@
 """Generation history with in-memory cache and disk persistence."""
 
+from __future__ import annotations
+
 import json
 import os
 import uuid
