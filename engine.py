@@ -7,7 +7,17 @@ import numpy as np
 from mlx_audio.tts.utils import load_model
 from mlx_audio.stt.utils import load_model as load_stt_model
 
-from config import MODELSCOPE_CACHE_ROOT, REPO_TEMPLATE, MODEL_VARIANTS, DEFAULT_MODEL_SIZE, DEFAULT_QUANTIZATION, ENABLE_JIT_COMPILE, ASR_REPO_ID
+from config import (
+    MODELSCOPE_CACHE_ROOT,
+    REPO_TEMPLATE,
+    MODEL_VARIANTS,
+    DEFAULT_MODEL_SIZE,
+    DEFAULT_QUANTIZATION,
+    ENABLE_JIT_COMPILE,
+    ASR_REPO_ID,
+    WHISPER_MODEL_VARIANTS,
+    DEFAULT_WHISPER_MODEL,
+)
 
 LOCK_TIMEOUT = 10  # seconds to wait for lock before raising
 
@@ -22,6 +32,8 @@ class TTSEngine:
         self.quantization = DEFAULT_QUANTIZATION
         self.jit_compile = ENABLE_JIT_COMPILE
         self.asr_model = None
+        self.whisper_model = None
+        self.whisper_model_name = None
         self.last_max_tokens = None  # Track last max_tokens to detect changes
         self._lock = threading.Lock()
 
@@ -160,9 +172,10 @@ class TTSEngine:
     # ----- ASR -----
 
     def _load_asr(self):
-        """Load ASR model, unloading TTS first. Caller must hold lock."""
+        """Load ASR model, unloading TTS/Whisper first. Caller must hold lock."""
         if self.asr_model is not None:
             return  # already loaded
+        self._unload_whisper_unlocked()
         self._unload_model_unlocked()  # free TTS
         self.asr_model = load_stt_model(ASR_REPO_ID)
         mx.eval(self.asr_model.parameters())
@@ -194,6 +207,82 @@ class TTSEngine:
             return result.text
         finally:
             self._unload_asr_unlocked()
+            self._lock.release()
+
+    # ----- Whisper (subtitle generation) -----
+
+    def _load_whisper(self, model_name: str = None):
+        """Load Whisper model, unloading TTS/ASR first. Caller must hold lock."""
+        model_name = model_name or DEFAULT_WHISPER_MODEL
+        if self.whisper_model is not None and self.whisper_model_name == model_name:
+            return  # already loaded
+        
+        self._unload_asr_unlocked()
+        self._unload_model_unlocked()
+        
+        repo_id = WHISPER_MODEL_VARIANTS.get(model_name)
+        if not repo_id:
+            raise ValueError(f"Unknown Whisper model: {model_name}")
+        
+        self.whisper_model = load_stt_model(repo_id)
+        self.whisper_model_name = model_name
+        mx.eval(self.whisper_model.parameters())
+
+    def _unload_whisper_unlocked(self):
+        """Free Whisper model. Caller must hold lock."""
+        if self.whisper_model is not None:
+            del self.whisper_model
+            self.whisper_model = None
+            self.whisper_model_name = None
+            gc.collect()
+
+    def unload_whisper(self):
+        """Free Whisper model (thread-safe)."""
+        self._acquire_lock()
+        try:
+            self._unload_whisper_unlocked()
+        finally:
+            self._lock.release()
+
+    def is_whisper_loaded(self) -> bool:
+        return self.whisper_model is not None
+
+    def generate_subtitles(self, audio_path, language="auto", model_name=None) -> list[dict]:
+        """
+        Generate subtitles with timestamps from audio file.
+        
+        Args:
+            audio_path: Path to audio file
+            language: Language code or "auto"
+            model_name: Whisper model variant name
+        
+        Returns:
+            List of dicts with 'start', 'end', 'text' keys
+        """
+        self._acquire_lock()
+        try:
+            self._load_whisper(model_name)
+            result = self.whisper_model.generate(audio_path, language=language)
+            
+            segments = []
+            if hasattr(result, "segments"):
+                for seg in result.segments:
+                    segments.append({
+                        "start": seg.get("start", 0.0),
+                        "end": seg.get("end", 0.0),
+                        "text": seg.get("text", "").strip(),
+                    })
+            elif hasattr(result, "text"):
+                # Fallback: single segment without timestamps
+                segments.append({
+                    "start": 0.0,
+                    "end": 0.0,
+                    "text": result.text.strip(),
+                })
+            
+            return segments
+        finally:
+            self._unload_whisper_unlocked()
             self._lock.release()
 
     def _to_numpy(self, result) -> tuple:

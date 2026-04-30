@@ -19,8 +19,29 @@ MODEL_VARIANTS = {
     "base": "Base",
 }
 
-# ASR model (fixed — do not change size/quant)
+# ASR model (Qwen3-ASR for transcription, no timestamps)
 ASR_REPO_ID = "mlx-community/Qwen3-ASR-1.7B-8bit"
+
+# Whisper model variants for subtitle generation (with timestamps)
+WHISPER_MODEL_VARIANTS = {
+    "tiny": "mlx-community/whisper-tiny-mlx",
+    "base": "mlx-community/whisper-base-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "large-v3-turbo": "mlx-community/whisper-large-v3-turbo-mlx",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+}
+DEFAULT_WHISPER_MODEL = "large-v3-turbo"
+
+# Whisper model sizes (approximate, for display)
+WHISPER_MODEL_INFO = {
+    "tiny": {"size": "39M", "speed": "~32x", "languages": 99},
+    "base": {"size": "74M", "speed": "~16x", "languages": 99},
+    "small": {"size": "244M", "speed": "~6x", "languages": 99},
+    "medium": {"size": "769M", "speed": "~2x", "languages": 99},
+    "large-v3-turbo": {"size": "1.5GB", "speed": "~8x", "languages": 100},
+    "large-v3": {"size": "1.5GB", "speed": "~1x", "languages": 100},
+}
 
 # Supported languages
 LANGUAGES = [

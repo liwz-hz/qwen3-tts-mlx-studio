@@ -39,6 +39,7 @@ from config import (
     DEFAULT_TOP_K,
     DEFAULT_TOP_P,
     DEFAULT_TRIM_SILENCE,
+    DEFAULT_WHISPER_MODEL,
     ENABLE_JIT_COMPILE,
     HISTORY_DIR,
     LANGUAGES,
@@ -48,6 +49,8 @@ from config import (
     SERVER_HOST,
     SERVER_PORT,
     VOICE_LIBRARY_DIR,
+    WHISPER_MODEL_VARIANTS,
+    WHISPER_MODEL_INFO,
     YT_CACHE_DIR,
 )
 from engine import TTSEngine
@@ -62,6 +65,13 @@ from error_handler import (
 )
 from history import GenerationHistory
 from script_parser import parse_script, group_by_model_type
+from subtitle_utils import (
+    generate_srt_content,
+    generate_vtt_content,
+    save_subtitle_file,
+    merge_short_segments,
+    split_long_segments,
+)
 from theme import build_theme, custom_css
 from voice_library import VoiceLibrary
 from yt_voice import get_yt_extractor
@@ -376,6 +386,85 @@ def save_transcript(text):
     with open(path, "w", encoding="utf-8") as f:
         f.write(text)
     return f"Saved: {path}"
+
+
+# ---------------------------------------------------------------------------
+# Whisper subtitle generation handlers
+# ---------------------------------------------------------------------------
+@with_error_popup_yield
+def generate_whisper_subtitles(audio_path, language, model_name, merge_short, split_long, progress=gr.Progress()):
+    """Generate subtitles with timestamps using Whisper."""
+    if not audio_path:
+        raise UserInputError(ERROR_MESSAGES["asr_empty"])
+    
+    lang = "auto" if language == "Auto" else language.lower()
+    
+    progress(0.1, desc=f"加载 Whisper {model_name} 模型...")
+    
+    segments = engine.generate_subtitles(audio_path, language=lang, model_name=model_name)
+    
+    progress(0.8, desc="处理字幕片段...")
+    
+    if not segments:
+        raise UserInputError("未生成字幕内容")
+    
+    if merge_short:
+        segments = merge_short_segments(segments, min_duration=1.5)
+    
+    if split_long:
+        segments = split_long_segments(segments, max_duration=7.0, max_chars=80)
+    
+    progress(1.0, desc="完成")
+    
+    text_only = "\n".join([seg["text"] for seg in segments])
+    total_duration = max([seg["end"] for seg in segments]) if segments else 0
+    
+    summary = f"✓ 已生成 {len(segments)} 条字幕 | 总时长 {total_duration:.1f}s"
+    
+    yield (
+        gr.update(value=text_only),
+        segments,
+        summary,
+    )
+
+
+@with_error_popup
+def export_subtitles(segments, format_type, prefix):
+    """Export subtitles to SRT or VTT file."""
+    if not segments:
+        raise UserInputError("没有字幕内容可导出")
+    
+    out_dir = app_settings["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{prefix}_{timestamp}"
+    path = os.path.join(out_dir, filename)
+    
+    actual_path = save_subtitle_file(segments, path, format=format_type)
+    
+    return f"✓ 已保存: {actual_path}"
+
+
+@with_error_popup
+def preview_subtitle_content(segments, format_type):
+    """Generate preview of subtitle file content."""
+    if not segments:
+        return "(无字幕内容)"
+    
+    if format_type == "srt":
+        return generate_srt_content(segments)
+    elif format_type == "vtt":
+        return generate_vtt_content(segments)
+    else:
+        return "(未知格式)"
+
+
+@with_error_popup
+def unload_whisper_model():
+    """Unload Whisper model to free memory."""
+    engine.unload_whisper()
+    return "✓ Whisper 模型已卸载"
 
 
 # ---------------------------------------------------------------------------
@@ -1554,7 +1643,117 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                     )
 
         # =================================================================
-        # Tab 7: Voice Library
+        # Tab 7: Whisper Subtitles
+        # =================================================================
+        with gr.Tab("Whisper Subtitles"):
+            gr.HTML(
+                "<div class='info-notice'>"
+                "使用 Whisper 模型生成带时间戳的字幕文件（SRT/VTT）。"
+                "支持多种模型大小，自动语言检测。"
+                "</div>"
+            )
+            
+            whisper_segments_state = gr.State([])
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gr.Markdown("### 输入音频")
+                    whisper_audio = gr.Audio(
+                        label="上传音频文件",
+                        type="filepath",
+                        sources=["upload", "microphone"],
+                    )
+                    
+                    gr.Markdown("### Whisper 模型选择")
+                    with gr.Row():
+                        whisper_model = gr.Dropdown(
+                            choices=list(WHISPER_MODEL_VARIANTS.keys()),
+                            value=DEFAULT_WHISPER_MODEL,
+                            label="模型",
+                            scale=2,
+                        )
+                        whisper_language = gr.Dropdown(
+                            choices=["Auto"] + LANGUAGES,
+                            value="Auto",
+                            label="语言",
+                            scale=1,
+                        )
+                    
+                    with gr.Accordion("模型信息", open=False):
+                        whisper_model_info_text = gr.Markdown(
+                            f"**当前模型:** {DEFAULT_WHISPER_MODEL}\n\n"
+                            f"**大小:** {WHISPER_MODEL_INFO[DEFAULT_WHISPER_MODEL]['size']}\n\n"
+                            f"**速度:** {WHISPER_MODEL_INFO[DEFAULT_WHISPER_MODEL]['speed']}\n\n"
+                            f"**支持语言:** {WHISPER_MODEL_INFO[DEFAULT_WHISPER_MODEL]['languages']}+"
+                        )
+                    
+                    gr.Markdown("### 字幕处理选项")
+                    with gr.Row():
+                        whisper_merge_short = gr.Checkbox(
+                            value=True,
+                            label="合并短片段",
+                            info="将小于 1.5 秒的片段合并",
+                        )
+                        whisper_split_long = gr.Checkbox(
+                            value=True,
+                            label="拆分长片段",
+                            info="将超过 7 秒或 80 字符的片段拆分",
+                        )
+                    
+                    whisper_generate_btn = gr.Button("生成字幕", variant="primary")
+                    whisper_unload_btn = gr.Button("卸载模型", variant="secondary")
+                    
+                    whisper_status = gr.Textbox(
+                        label="状态",
+                        interactive=False,
+                        elem_classes=["save-status-text"],
+                    )
+                    
+                with gr.Column(scale=1, elem_classes=["output-col"]):
+                    gr.Markdown("### 输出预览")
+                    whisper_text_output = gr.Textbox(
+                        label="纯文本预览",
+                        lines=8,
+                        interactive=False,
+                    )
+                    
+                    gr.Markdown("### 字幕片段")
+                    whisper_table = gr.Dataframe(
+                        headers=["开始", "结束", "文本"],
+                        value=[["", "", ""]],
+                        label="字幕片段列表",
+                        interactive=False,
+                    )
+            
+            with gr.Accordion("导出字幕文件", open=True):
+                with gr.Row():
+                    whisper_format = gr.Radio(
+                        choices=["srt", "vtt"],
+                        value="srt",
+                        label="格式",
+                        scale=1,
+                    )
+                    whisper_prefix = gr.Textbox(
+                        value="subtitles",
+                        label="文件名前缀",
+                        scale=2,
+                    )
+                whisper_preview_btn = gr.Button("预览字幕内容", variant="secondary")
+                whisper_preview_content = gr.Textbox(
+                    label="字幕文件预览",
+                    lines=12,
+                    interactive=False,
+                )
+                with gr.Row():
+                    whisper_export_btn = gr.Button("导出字幕文件", variant="primary")
+                    whisper_export_status = gr.Textbox(
+                        show_label=False,
+                        interactive=False,
+                        elem_classes=["save-status-text"],
+                    )
+
+        # =================================================================
+        # Tab 8: Voice Library
         # =================================================================
         with gr.Tab("Voice Library"):
             with gr.Row():
@@ -1601,7 +1800,7 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                     lib_import_btn = gr.Button("Import Voice", variant="primary")
 
         # =================================================================
-        # Tab 8: History
+        # Tab 9: History
         # =================================================================
         with gr.Tab("History"):
             hist_table = gr.Dataframe(
@@ -1637,7 +1836,7 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                 )
 
         # =================================================================
-        # Tab 9: Settings
+        # Tab 10: Settings
         # =================================================================
         with gr.Tab("Settings"):
             with gr.Row():
@@ -1952,6 +2151,59 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
         fn=save_transcript,
         inputs=[asr_output],
         outputs=[asr_save_status],
+    )
+
+    # --- Whisper Subtitles ---
+    def _update_whisper_table(segments):
+        """Convert segments to table format."""
+        if not segments:
+            return [["", "", ""]]
+        return [
+            [f"{seg['start']:.2f}s", f"{seg['end']:.2f}s", seg['text']]
+            for seg in segments
+        ]
+    
+    def _update_whisper_model_info(model_name):
+        """Update model info display."""
+        info = WHISPER_MODEL_INFO.get(model_name, {})
+        return f"**当前模型:** {model_name}\n\n" \
+               f"**大小:** {info.get('size', 'N/A')}\n\n" \
+               f"**速度:** {info.get('speed', 'N/A')}\n\n" \
+               f"**支持语言:** {info.get('languages', 99)}+"
+    
+    whisper_model.change(
+        fn=_update_whisper_model_info,
+        inputs=[whisper_model],
+        outputs=[whisper_model_info_text],
+    )
+    
+    whisper_generate_btn.click(
+        fn=generate_whisper_subtitles,
+        inputs=[whisper_audio, whisper_language, whisper_model, 
+                whisper_merge_short, whisper_split_long],
+        outputs=[whisper_text_output, whisper_segments_state, whisper_status],
+        show_progress="full",
+    ).then(
+        fn=_update_whisper_table,
+        inputs=[whisper_segments_state],
+        outputs=[whisper_table],
+    )
+    
+    whisper_unload_btn.click(
+        fn=unload_whisper_model,
+        outputs=[whisper_status],
+    )
+    
+    whisper_preview_btn.click(
+        fn=preview_subtitle_content,
+        inputs=[whisper_segments_state, whisper_format],
+        outputs=[whisper_preview_content],
+    )
+    
+    whisper_export_btn.click(
+        fn=export_subtitles,
+        inputs=[whisper_segments_state, whisper_format, whisper_prefix],
+        outputs=[whisper_export_status],
     )
 
     # --- Script Mode ---
