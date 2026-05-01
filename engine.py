@@ -1,4 +1,5 @@
 import gc
+import logging
 import os
 import threading
 
@@ -19,7 +20,80 @@ from config import (
     DEFAULT_WHISPER_MODEL,
 )
 
-LOCK_TIMEOUT = 10  # seconds to wait for lock before raising
+logger = logging.getLogger(__name__)
+LOCK_TIMEOUT = 10
+
+
+def _find_local_model_path(repo_id: str) -> str:
+    """
+    Find local model path in ModelScope cache.
+    ModelScope replaces '.' with '___' in directory names.
+    Returns absolute path if found, None otherwise.
+    """
+    if not repo_id:
+        return None
+    
+    model_name = repo_id.split("/")[-1]
+    cache_dir = MODELSCOPE_CACHE_ROOT
+    
+    # Ensure cache directory exists
+    if not os.path.isdir(cache_dir):
+        logger.warning(f"ModelScope cache directory not found: {cache_dir}")
+        return None
+    
+    # Try exact name first (symlink)
+    exact_path = os.path.join(cache_dir, model_name)
+    if os.path.isdir(exact_path) and os.listdir(exact_path):
+        logger.info(f"Found model at exact path: {exact_path}")
+        return os.path.abspath(exact_path)
+    
+    # Try ModelScope's dot-to-underscore conversion
+    converted_name = model_name.replace(".", "___")
+    converted_path = os.path.join(cache_dir, converted_name)
+    if os.path.isdir(converted_path) and os.listdir(converted_path):
+        logger.info(f"Found model at converted path: {converted_path}")
+        return os.path.abspath(converted_path)
+    
+    # Try alternative naming patterns
+    alt_patterns = [
+        model_name.replace("-", "_"),
+        model_name.replace("-", "___"),
+        model_name.replace(".", "-"),
+    ]
+    for pattern in alt_patterns:
+        alt_path = os.path.join(cache_dir, pattern)
+        if os.path.isdir(alt_path) and os.listdir(alt_path):
+            logger.info(f"Found model at alternative path: {alt_path}")
+            return os.path.abspath(alt_path)
+    
+    logger.warning(f"Model not found in cache: {model_name}")
+    return None
+
+
+def _ensure_model_available(repo_id: str, model_type: str) -> str:
+    """
+    Ensure model is available locally. Returns local path or raises error with download instructions.
+    """
+    local_path = _find_local_model_path(repo_id)
+    
+    if local_path:
+        # Verify path contains actual model files
+        required_files = ["config.json", "model.safetensors"]
+        has_model = any(
+            f.endswith(".safetensors") for f in os.listdir(local_path)
+        )
+        if has_model:
+            return local_path
+        logger.warning(f"Model directory exists but may be incomplete: {local_path}")
+    
+    model_name = repo_id.split("/")[-1]
+    raise FileNotFoundError(
+        f"{'模型' if 'TTS' in model_name else 'ASR/Whisper 模型'}未找到: {model_name}\n\n"
+        f"请先下载模型:\n"
+        f"  modelscope download {repo_id}\n\n"
+        f"或访问: https://modelscope.cn/models/{repo_id}\n\n"
+        f"模型缓存目录: {MODELSCOPE_CACHE_ROOT}"
+    )
 
 
 class TTSEngine:
@@ -27,18 +101,17 @@ class TTSEngine:
 
     def __init__(self):
         self.current_model = None
-        self.current_model_type = None  # "custom_voice" | "voice_design" | "base"
+        self.current_model_type = None
         self.model_size = DEFAULT_MODEL_SIZE
         self.quantization = DEFAULT_QUANTIZATION
         self.jit_compile = ENABLE_JIT_COMPILE
+        self._model_loaded_with_jit = False
         self.asr_model = None
         self.whisper_model = None
         self.whisper_model_name = None
-        self.last_max_tokens = None  # Track last max_tokens to detect changes
         self._lock = threading.Lock()
 
     def _acquire_lock(self):
-        """Acquire lock with timeout so callers don't hang forever."""
         if not self._lock.acquire(timeout=LOCK_TIMEOUT):
             raise RuntimeError(
                 "Engine is busy with a previous generation. Please wait and try again."
@@ -50,53 +123,51 @@ class TTSEngine:
         repo_name = REPO_TEMPLATE.format(
             size=self.model_size, variant=variant, quant=self.quantization
         )
-        return os.path.join(MODELSCOPE_CACHE_ROOT, repo_name)
-
-    def _load_model(self, model_type: str, max_tokens=None):
-        """Load model, unloading previous if different. Caller must hold lock.
+        repo_id = f"mlx-community/{repo_name}"
         
-        If max_tokens changes and JIT is enabled, force reload to clear compile cache.
-        """
+        return _ensure_model_available(repo_id, model_type)
+
+    def _load_model(self, model_type: str):
+        """Load model, unloading previous if different. Caller must hold lock."""
         self._unload_asr_unlocked()
         
-        need_reload = False
-        
         if self.current_model_type != model_type:
-            need_reload = True
-        elif self.jit_compile and max_tokens is not None and self.last_max_tokens != max_tokens:
-            need_reload = True
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.info(f"[ENGINE] max_tokens changed from {self.last_max_tokens} to {max_tokens}, reloading model")
-        
-        if need_reload:
             self._unload_model_unlocked()
             repo_id = self.get_repo_id(model_type)
+            logger.info(f"Loading TTS model: {repo_id}")
             self.current_model = load_model(repo_id)
             self.current_model_type = model_type
-            if self.jit_compile:
-                self._apply_compile()
+            self._model_loaded_with_jit = False
             mx.eval(self.current_model.parameters())
-        
-        if max_tokens is not None:
-            self.last_max_tokens = max_tokens
 
-    def _apply_compile(self):
-        """Wrap talker forward passes with mx.compile for faster inference."""
+    def _apply_jit_compile(self):
+        """Apply JIT compilation to model. Only compiles once per model load."""
+        if self._model_loaded_with_jit or not self.jit_compile:
+            return
+        
         talker = getattr(self.current_model, "talker", None)
         if talker is None:
+            logger.warning("No talker found in model, skipping JIT")
             return
-        talker.__call__ = mx.compile(talker.__call__, shapeless=True)
-        code_pred = getattr(talker, "code_predictor", None)
-        if code_pred is not None:
-            code_pred.__call__ = mx.compile(code_pred.__call__, shapeless=True)
+        
+        try:
+            logger.info("Applying JIT compilation...")
+            talker.__call__ = mx.compile(talker.__call__, shapeless=False)
+            
+            code_pred = getattr(talker, "code_predictor", None)
+            if code_pred is not None:
+                code_pred.__call__ = mx.compile(code_pred.__call__, shapeless=False)
+            
+            self._model_loaded_with_jit = True
+            logger.info("JIT compilation applied successfully")
+        except Exception as e:
+            logger.warning(f"JIT compilation failed, continuing without JIT: {e}")
+            self.jit_compile = False
 
     def is_model_loaded(self, model_type: str) -> bool:
-        """Return True if this model type is already in memory (no swap needed)."""
         return self.current_model_type == model_type
 
     def unload_model(self):
-        """Free memory from current model (thread-safe)."""
         self._acquire_lock()
         try:
             self._unload_model_unlocked()
@@ -104,20 +175,21 @@ class TTSEngine:
             self._lock.release()
 
     def _unload_model_unlocked(self):
-        """Free memory from current model (and ASR if loaded). Caller must hold lock."""
         self._unload_asr_unlocked()
         if self.current_model is not None:
+            logger.info(f"Unloading model: {self.current_model_type}")
             del self.current_model
             self.current_model = None
             self.current_model_type = None
+            self._model_loaded_with_jit = False
             gc.collect()
 
     def generate_custom_voice(self, text, speaker, language, instruct="", **kwargs) -> tuple:
-        """Returns (sample_rate, numpy_audio_array)."""
         self._acquire_lock()
         try:
-            max_tokens = kwargs.get("max_tokens")
-            self._load_model("custom_voice", max_tokens=max_tokens)
+            self._load_model("custom_voice")
+            self._apply_jit_compile()
+            
             results = list(
                 self.current_model.generate_custom_voice(
                     text=text, speaker=speaker, language=language, instruct=instruct,
@@ -129,11 +201,11 @@ class TTSEngine:
             self._lock.release()
 
     def generate_voice_design(self, text, language, instruct, **kwargs) -> tuple:
-        """Returns (sample_rate, numpy_audio_array)."""
         self._acquire_lock()
         try:
-            max_tokens = kwargs.get("max_tokens")
-            self._load_model("voice_design", max_tokens=max_tokens)
+            self._load_model("voice_design")
+            self._apply_jit_compile()
+            
             results = list(
                 self.current_model.generate_voice_design(
                     text=text, language=language, instruct=instruct,
@@ -146,16 +218,53 @@ class TTSEngine:
 
     def generate_voice_clone(self, text, ref_audio_path, ref_text, language="English",
                              denoise_ref=False, **kwargs) -> tuple:
-        """Returns (sample_rate, numpy_audio_array)."""
         self._acquire_lock()
         tmp_denoised = None
         try:
+            logger.info(f"generate_voice_clone called: text='{text[:50]}...', ref_audio={ref_audio_path}, ref_text='{ref_text[:30]}...', language={language}, denoise={denoise_ref}")
+            
+            # Validate inputs
+            if not text or not text.strip():
+                logger.error("Empty text")
+                raise ValueError("生成文本不能为空")
+            if not ref_audio_path:
+                logger.error("Empty ref_audio_path")
+                raise ValueError("参考音频路径为空")
+            if not isinstance(ref_audio_path, str):
+                logger.error(f"ref_audio_path wrong type: {type(ref_audio_path)}")
+                raise ValueError(f"参考音频路径格式错误: 期望字符串，实际 {type(ref_audio_path).__name__}")
+            if not os.path.isfile(ref_audio_path):
+                logger.error(f"Audio file not found: {ref_audio_path}")
+                raise ValueError(f"参考音频文件不存在: {ref_audio_path}")
+            if not ref_text or not ref_text.strip():
+                logger.error("Empty ref_text")
+                raise ValueError("参考转录文本不能为空")
+            
+            # Check audio file validity
+            try:
+                import soundfile as sf
+                info = sf.info(ref_audio_path)
+                logger.info(f"Audio file info: {info.duration:.1f}s, {info.samplerate}Hz, {info.channels} channels, {info.format}")
+                if info.duration < 1.0:
+                    logger.warning(f"Audio too short: {info.duration}s (recommended: 3-30s)")
+                elif info.duration > 60.0:
+                    logger.warning(f"Audio too long: {info.duration}s (recommended: 3-30s)")
+            except Exception as e:
+                logger.error(f"Failed to read audio file: {e}")
+                raise ValueError(f"无法读取音频文件: {e}")
+            
             if denoise_ref:
+                logger.info("Applying denoising...")
                 from audio_utils import denoise_ref_audio
                 tmp_denoised = denoise_ref_audio(ref_audio_path)
                 ref_audio_path = tmp_denoised
-            max_tokens = kwargs.get("max_tokens")
-            self._load_model("base", max_tokens=max_tokens)
+                logger.info(f"Denoised audio saved to: {tmp_denoised}")
+            
+            logger.info("Loading base model...")
+            self._load_model("base")
+            self._apply_jit_compile()
+            
+            logger.info("Starting generation...")
             results = list(
                 self.current_model.generate(
                     text=text, ref_audio=ref_audio_path, ref_text=ref_text,
@@ -163,32 +272,37 @@ class TTSEngine:
                     **kwargs,
                 )
             )
+            logger.info(f"Generation completed, result type: {type(results[0])}")
             return self._to_numpy(results[0])
+        except Exception as e:
+            logger.exception(f"Voice clone generation failed: {type(e).__name__}: {e}")
+            raise
         finally:
             if tmp_denoised and os.path.isfile(tmp_denoised):
+                logger.info(f"Cleaning up denoised temp file: {tmp_denoised}")
                 os.remove(tmp_denoised)
             self._lock.release()
 
-    # ----- ASR -----
-
     def _load_asr(self):
-        """Load ASR model, unloading TTS/Whisper first. Caller must hold lock."""
+        """Load ASR model from local cache. Caller must hold lock."""
         if self.asr_model is not None:
-            return  # already loaded
+            return
         self._unload_whisper_unlocked()
-        self._unload_model_unlocked()  # free TTS
-        self.asr_model = load_stt_model(ASR_REPO_ID)
+        self._unload_model_unlocked()
+        
+        local_path = _ensure_model_available(ASR_REPO_ID, "asr")
+        logger.info(f"Loading ASR model: {local_path}")
+        self.asr_model = load_stt_model(local_path)
         mx.eval(self.asr_model.parameters())
 
     def _unload_asr_unlocked(self):
-        """Free ASR model. Caller must hold lock."""
         if self.asr_model is not None:
+            logger.info("Unloading ASR model")
             del self.asr_model
             self.asr_model = None
             gc.collect()
 
     def unload_asr(self):
-        """Free ASR model (thread-safe)."""
         self._acquire_lock()
         try:
             self._unload_asr_unlocked()
@@ -199,9 +313,12 @@ class TTSEngine:
         return self.asr_model is not None
 
     def transcribe(self, audio_path, language="auto") -> str:
-        """Transcribe audio file, returns text. Loads/unloads ASR automatically."""
         self._acquire_lock()
         try:
+            # Validate input
+            if not audio_path or not os.path.isfile(audio_path):
+                raise ValueError(f"音频文件不存在: {audio_path}")
+            
             self._load_asr()
             result = self.asr_model.generate(audio_path, language=language)
             return result.text
@@ -209,13 +326,11 @@ class TTSEngine:
             self._unload_asr_unlocked()
             self._lock.release()
 
-    # ----- Whisper (subtitle generation) -----
-
     def _load_whisper(self, model_name: str = None):
-        """Load Whisper model, unloading TTS/ASR first. Caller must hold lock."""
+        """Load Whisper model from local cache. Caller must hold lock."""
         model_name = model_name or DEFAULT_WHISPER_MODEL
         if self.whisper_model is not None and self.whisper_model_name == model_name:
-            return  # already loaded
+            return
         
         self._unload_asr_unlocked()
         self._unload_model_unlocked()
@@ -224,35 +339,21 @@ class TTSEngine:
         if not repo_id:
             raise ValueError(f"Unknown Whisper model: {model_name}")
         
-        # Try to load from ModelScope cache first
-        local_path = os.path.join(
-            os.path.expanduser("~"),
-            ".cache",
-            "modelscope",
-            "hub",
-            "models",
-            repo_id.replace("/", "/")
-        )
-        
-        # Use local path if exists, otherwise let mlx_audio handle download
-        if os.path.isdir(local_path) and os.listdir(local_path):
-            self.whisper_model = load_stt_model(local_path)
-        else:
-            self.whisper_model = load_stt_model(repo_id)
-        
+        local_path = _ensure_model_available(repo_id, "whisper")
+        logger.info(f"Loading Whisper model: {local_path}")
+        self.whisper_model = load_stt_model(local_path)
         self.whisper_model_name = model_name
         mx.eval(self.whisper_model.parameters())
 
     def _unload_whisper_unlocked(self):
-        """Free Whisper model. Caller must hold lock."""
         if self.whisper_model is not None:
+            logger.info("Unloading Whisper model")
             del self.whisper_model
             self.whisper_model = None
             self.whisper_model_name = None
             gc.collect()
 
     def unload_whisper(self):
-        """Free Whisper model (thread-safe)."""
         self._acquire_lock()
         try:
             self._unload_whisper_unlocked()
@@ -263,19 +364,11 @@ class TTSEngine:
         return self.whisper_model is not None
 
     def generate_subtitles(self, audio_path, language="auto", model_name=None) -> list[dict]:
-        """
-        Generate subtitles with timestamps from audio file.
-        
-        Args:
-            audio_path: Path to audio file
-            language: Language code or "auto"
-            model_name: Whisper model variant name
-        
-        Returns:
-            List of dicts with 'start', 'end', 'text' keys
-        """
         self._acquire_lock()
         try:
+            if not audio_path or not os.path.isfile(audio_path):
+                raise ValueError(f"音频文件不存在: {audio_path}")
+            
             self._load_whisper(model_name)
             result = self.whisper_model.generate(audio_path, language=language)
             
@@ -288,7 +381,6 @@ class TTSEngine:
                         "text": seg.get("text", "").strip(),
                     })
             elif hasattr(result, "text"):
-                # Fallback: single segment without timestamps
                 segments.append({
                     "start": 0.0,
                     "end": 0.0,
@@ -301,7 +393,6 @@ class TTSEngine:
             self._lock.release()
 
     def _to_numpy(self, result) -> tuple:
-        """Convert mlx array result to numpy for Gradio Audio component."""
         audio = np.array(result.audio, dtype=np.float32)
         sr = getattr(result, "sample_rate", 24000)
         return (sr, audio)

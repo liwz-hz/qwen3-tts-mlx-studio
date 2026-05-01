@@ -62,6 +62,7 @@ OUTPUT_DIR = "./outputs"
 VOICE_LIBRARY_DIR = "./voices"
 HISTORY_DIR = "./outputs/history"
 YT_CACHE_DIR = ".yt_cache"
+RECORDINGS_DIR = "./outputs/recordings"
 
 # History settings
 MAX_HISTORY_ENTRIES = 50

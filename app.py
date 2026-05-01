@@ -52,6 +52,7 @@ from config import (
     WHISPER_MODEL_VARIANTS,
     WHISPER_MODEL_INFO,
     YT_CACHE_DIR,
+    RECORDINGS_DIR,
 )
 from engine import TTSEngine
 from error_handler import (
@@ -75,6 +76,7 @@ from subtitle_utils import (
 from theme import build_theme, custom_css
 from voice_library import VoiceLibrary
 from yt_voice import get_yt_extractor
+from recorder import RecorderManager
 
 # ---------------------------------------------------------------------------
 # CLI arguments
@@ -131,6 +133,7 @@ engine.quantization = args.quant
 library = VoiceLibrary()
 history = GenerationHistory()
 yt_extractor = get_yt_extractor()
+recorder = RecorderManager()
 
 # ---------------------------------------------------------------------------
 # Logging setup - only warnings and errors to console, all levels to file
@@ -140,10 +143,11 @@ import sys
 
 LOG_FILE = '/tmp/qwen3_tts_debug.log'
 logging.basicConfig(
-    level=logging.WARNING,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
         logging.FileHandler(LOG_FILE, encoding='utf-8'),
+        logging.StreamHandler(sys.stdout),
     ],
 )
 logger = logging.getLogger(__name__)
@@ -295,20 +299,52 @@ def generate_voice_design(text, language, instruct):
 
 @with_error_popup
 def generate_voice_clone(text, ref_audio, ref_text, language, library_voice):
+    logger.info(f"Voice clone request: text='{text[:50]}...', ref_audio={ref_audio}, ref_text='{ref_text[:30]}...', language={language}, library_voice={library_voice}")
+    
     if not text.strip():
+        logger.warning("Empty text input")
         raise UserInputError(ERROR_MESSAGES["empty_text"])
+    
     if library_voice and library_voice != "None":
+        logger.info(f"Loading library voice: {library_voice}")
         try:
             voice = library.load_voice(library_voice)
             ref_audio = library.get_ref_audio_path(library_voice)
             ref_text = voice["ref_text"]
+            logger.info(f"Library voice loaded: ref_audio={ref_audio}, ref_text='{ref_text[:30]}...'")
         except FileNotFoundError:
+            logger.error(f"Voice not found: {library_voice}")
             raise ResourceError(ERROR_MESSAGES["voice_not_found"].format(name=library_voice))
+    
+    # Enhanced validation with logging
+    logger.info(f"Validating inputs: ref_audio type={type(ref_audio)}, value={ref_audio}")
+    
     if not ref_audio:
+        logger.warning("ref_audio is None or empty")
         raise UserInputError(ERROR_MESSAGES["empty_ref_audio"])
+    
+    # Handle different Gradio Audio return formats
+    if isinstance(ref_audio, dict):
+        logger.warning(f"ref_audio returned as dict: {ref_audio.keys()}")
+        ref_audio = ref_audio.get('path') or ref_audio.get('data')
+    
+    if isinstance(ref_audio, tuple):
+        logger.warning(f"ref_audio returned as tuple (sr, audio)")
+        raise UserInputError("音频上传格式错误，请重新上传或使用麦克风录制")
+    
+    if not isinstance(ref_audio, str):
+        logger.error(f"ref_audio unexpected type: {type(ref_audio)}")
+        raise UserInputError(f"音频路径格式错误: {type(ref_audio).__name__}")
+    
+    if not os.path.isfile(ref_audio):
+        logger.error(f"Audio file not found: {ref_audio}")
+        raise UserInputError(f"参考音频文件不存在: {ref_audio}")
+    
     if not ref_text or not ref_text.strip():
+        logger.warning("Empty ref_text")
         raise UserInputError(ERROR_MESSAGES["empty_ref_text"])
     
+    logger.info(f"All inputs valid, starting generation...")
     start = time.time()
     sr, audio = engine.generate_voice_clone(
         text, ref_audio, ref_text, language,
@@ -327,6 +363,7 @@ def generate_voice_clone(text, ref_audio, ref_text, language, library_voice):
         save_msg = " | " + save_audio(result, "clone")
     denoise_msg = " | 已降噪" if app_settings["denoise_ref"] else ""
     status_text = f"✓ 完成 {elapsed:.1f}s | 模型: {engine.get_repo_id('base')}{denoise_msg}{save_msg}"
+    logger.info(f"Generation completed successfully in {elapsed:.1f}s")
     return result, status_text
 
 
@@ -1074,6 +1111,110 @@ def rename_voice(old_name, new_name):
 
 
 # ---------------------------------------------------------------------------
+# Recorder handlers
+# ---------------------------------------------------------------------------
+def _get_filename_from_dropdown(choice):
+    """Extract filename from dropdown choice string."""
+    return recorder.parse_filename_from_choice(choice)
+
+
+def refresh_recording_list():
+    """Refresh recording dropdown and table."""
+    choices = recorder.dropdown_choices()
+    table = recorder.table_data()
+    return (
+        gr.update(choices=choices, value="(无录音)" if not choices or choices[0] == "(无录音)" else choices[0]),
+        table,
+        None,
+    )
+
+
+@with_error_popup
+def save_recording(audio_tuple, name):
+    if audio_tuple is None:
+        raise UserInputError("请先录制音频")
+    path = recorder.save_recording(audio_tuple, name)
+    if not path:
+        raise ResourceError("保存失败")
+    filename = os.path.basename(path)
+    info = sf.info(path)
+    
+    # Refresh dropdown and select the new recording
+    choices = recorder.dropdown_choices()
+    new_choice = f"{filename} ({info.duration:.1f}s, {datetime.now().strftime('%Y-%m-%d %H:%M')})"
+    
+    return (
+        gr.update(choices=choices, value=new_choice),
+        recorder.table_data(),
+        f"✓ 已保存: {filename} ({info.duration:.1f}s)",
+        None,
+    )
+
+
+@with_error_popup
+def delete_recording(dropdown_choice):
+    filename = _get_filename_from_dropdown(dropdown_choice)
+    if not filename:
+        raise UserInputError("请选择要删除的录音")
+    if not recorder.delete_recording(filename):
+        raise ResourceError("删除失败")
+    
+    choices = recorder.dropdown_choices()
+    return (
+        gr.update(choices=choices, value="(无录音)" if choices[0] == "(无录音)" else choices[0]),
+        recorder.table_data(),
+        f"✓ 已删除: {filename}",
+        None,
+    )
+
+
+def play_recording(dropdown_choice):
+    filename = _get_filename_from_dropdown(dropdown_choice)
+    if not filename:
+        return None
+    path = recorder.get_recording_path(filename)
+    return path
+
+
+@with_error_popup
+def import_recording_to_library(dropdown_choice, voice_name, transcript, language):
+    filename = _get_filename_from_dropdown(dropdown_choice)
+    if not filename:
+        raise UserInputError("请选择录音文件")
+    if not voice_name or not voice_name.strip():
+        raise UserInputError("请输入音色名称")
+    if not transcript or not transcript.strip():
+        raise UserInputError("请输入转录文本")
+    
+    path = recorder.get_recording_path(filename)
+    if not path:
+        raise ResourceError("录音文件不存在")
+    
+    library.save_voice(
+        name=voice_name.strip(),
+        ref_audio_path=path,
+        ref_text=transcript.strip(),
+        language=language,
+        source="recording",
+    )
+    return (
+        f"✓ 已导入 '{voice_name.strip()}' 到音色库",
+        _voice_table(),
+        gr.update(choices=_voice_choices()),
+    )
+
+
+def use_recording_for_clone(dropdown_choice):
+    filename = _get_filename_from_dropdown(dropdown_choice)
+    if not filename:
+        return None, "请先选择录音"
+    path = recorder.get_recording_path(filename)
+    if not path:
+        return None, "录音文件不存在"
+    return path, f"✓ 已填充到 Voice Cloning，请切换标签页继续"
+
+
+# ---------------------------------------------------------------------------
 # Settings handlers
 # ---------------------------------------------------------------------------
 def apply_settings(
@@ -1368,13 +1509,12 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                         type="filepath",
                         sources=["upload", "microphone"],
                     )
-                    with gr.Row():
-                        vc_transcribe_btn = gr.Button("Transcribe Reference", variant="secondary", scale=1)
-                    gr.HTML("<div class='text-hint'>Auto-fills transcript using Qwen3-ASR-1.7B-8bit</div>")
+                    vc_transcribe_btn = gr.Button("🔄 自动转录参考音频", variant="primary", scale=1)
+                    gr.HTML("<div class='text-hint'><strong>重要：</strong>上传音频后，点击上方按钮自动生成转录文本，无需手动输入</div>")
                     vc_ref_text = gr.Textbox(
-                        label="Reference Transcript (required)",
+                        label="Reference Transcript（自动填充或手动输入）",
                         lines=2,
-                        placeholder="Exact text spoken in reference audio",
+                        placeholder="点击 '自动转录参考音频' 按钮生成，或手动输入...",
                     )
                     vc_text = gr.Textbox(
                         label="Text to Speak",
@@ -1426,7 +1566,108 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                     )
 
         # =================================================================
-        # Tab 4: YT Voice Clone
+        # Tab 4: Recorder
+        # =================================================================
+        with gr.Tab("Recorder"):
+            gr.HTML(
+                "<div class='info-notice'>"
+                "录制参考音频并保存到本地，用于 Voice Cloning 或导入到音色库。"
+                "</div>"
+            )
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gr.Markdown("### 录音")
+                    gr.HTML("<div class='text-hint'>录音后可在波形图上裁剪，拖动边缘选择保留区域</div>")
+                    rec_audio_input = gr.Audio(
+                        label="麦克风录音",
+                        type="numpy",
+                        sources=["microphone"],
+                        editable=True,
+                    )
+                    with gr.Row():
+                        rec_name = gr.Textbox(
+                            label="录音名称（可选）",
+                            placeholder="留空则自动命名",
+                            scale=2,
+                        )
+                        rec_save_btn = gr.Button("保存录音", variant="primary", scale=1)
+                    rec_save_status = gr.Textbox(
+                        show_label=False,
+                        interactive=False,
+                        placeholder="保存状态...",
+                        elem_classes=["save-status-text"],
+                    )
+                    
+                    gr.Markdown("### 已保存录音")
+                    with gr.Row():
+                        rec_dropdown = gr.Dropdown(
+                            choices=recorder.dropdown_choices(),
+                            value="(无录音)",
+                            label="选择录音",
+                            scale=3,
+                            info="显示格式: 文件名 (时长, 创建时间)",
+                        )
+                        rec_refresh_btn = gr.Button("刷新列表", scale=1)
+                    
+                    rec_preview_audio = gr.Audio(
+                        label="录音预览",
+                        type="filepath",
+                        interactive=False,
+                    )
+                    
+                    with gr.Row():
+                        rec_play_btn = gr.Button("播放选中录音", scale=1)
+                        rec_delete_btn = gr.Button("删除选中录音", variant="stop", scale=1)
+                    rec_status = gr.Textbox(
+                        show_label=False,
+                        interactive=False,
+                        placeholder="操作状态...",
+                        elem_classes=["save-status-text"],
+                    )
+                    
+                    gr.Markdown("### 录音详情")
+                    rec_table = gr.Dataframe(
+                        headers=["文件名", "时长", "创建时间", "路径"],
+                        value=recorder.table_data(),
+                        label="全部录音列表",
+                        interactive=False,
+                    )
+                    
+                with gr.Column(scale=1, elem_classes=["output-col"]):
+                    gr.Markdown("### 导入到音色库")
+                    rec_import_name = gr.Textbox(
+                        label="音色名称",
+                        placeholder="my_voice",
+                    )
+                    rec_import_transcript = gr.Textbox(
+                        label="转录文本",
+                        lines=3,
+                        placeholder="输入录音中说的内容...",
+                    )
+                    rec_import_language = gr.Dropdown(
+                        choices=LANGUAGES,
+                        value="English",
+                        label="语言",
+                    )
+                    rec_import_btn = gr.Button("导入到音色库", variant="primary")
+                    rec_import_status = gr.Textbox(
+                        show_label=False,
+                        interactive=False,
+                        placeholder="导入状态...",
+                        elem_classes=["save-status-text"],
+                    )
+                    
+                    gr.Markdown("### 快速操作")
+                    rec_use_for_clone_btn = gr.Button("用于 Voice Clone", variant="secondary")
+                    rec_use_status = gr.Textbox(
+                        show_label=False,
+                        interactive=False,
+                        placeholder="点击后跳转到 Voice Cloning 标签页",
+                        elem_classes=["save-status-text"],
+                    )
+
+        # =================================================================
+        # Tab 5: YT Voice Clone
         # =================================================================
         with gr.Tab("YT Voice Clone"):
             gr.HTML(
@@ -2111,6 +2352,44 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
     vc_library_voice.focus(
         fn=refresh_clone_library,
         outputs=[vc_library_voice],
+    )
+
+    # --- Recorder ---
+    rec_save_btn.click(
+        fn=save_recording,
+        inputs=[rec_audio_input, rec_name],
+        outputs=[rec_dropdown, rec_table, rec_save_status, rec_preview_audio],
+    )
+    rec_refresh_btn.click(
+        fn=refresh_recording_list,
+        outputs=[rec_dropdown, rec_table, rec_preview_audio],
+    )
+    rec_play_btn.click(
+        fn=play_recording,
+        inputs=[rec_dropdown],
+        outputs=[rec_preview_audio],
+    )
+    rec_delete_btn.click(
+        fn=delete_recording,
+        inputs=[rec_dropdown],
+        outputs=[rec_dropdown, rec_table, rec_status, rec_preview_audio],
+    )
+    
+    def _import_recording_and_refresh(dropdown_choice, voice_name, transcript, language):
+        status, lib_table_update, vc_lib_update = import_recording_to_library(
+            dropdown_choice, voice_name, transcript, language
+        )
+        return status, lib_table_update, vc_lib_update
+    
+    rec_import_btn.click(
+        fn=_import_recording_and_refresh,
+        inputs=[rec_dropdown, rec_import_name, rec_import_transcript, rec_import_language],
+        outputs=[rec_import_status, lib_table, vc_library_voice],
+    )
+    rec_use_for_clone_btn.click(
+        fn=use_recording_for_clone,
+        inputs=[rec_dropdown],
+        outputs=[vc_ref_audio, rec_use_status],
     )
 
     # --- YT Voice Clone ---
