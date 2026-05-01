@@ -1,6 +1,9 @@
 import os
 import warnings
 
+# Force MLX to clear memory on exit - prevents segfault on macOS
+os.environ["MLX_FORCE_MEM_CLEAR"] = "1"
+
 # Suppress known-harmless upstream warnings:
 # - "model of type qwen3_tts to instantiate a model of type ." (unregistered model type)
 # - "incorrect regex pattern ... fix_mistral_regex=True" (Qwen2Tokenizer regex issue)
@@ -9,7 +12,9 @@ os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 warnings.filterwarnings("ignore", message="Trying to convert audio")
 
 import argparse
+import atexit
 import concurrent.futures
+import gc
 import shutil
 import sys
 import time
@@ -134,6 +139,21 @@ library = VoiceLibrary()
 history = GenerationHistory()
 yt_extractor = get_yt_extractor()
 recorder = RecorderManager()
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown handler - prevents segfault on exit
+# ---------------------------------------------------------------------------
+def _graceful_shutdown():
+    """Clean up MLX models and resources before exit."""
+    try:
+        engine.unload_model()
+        engine.unload_asr()
+        engine.unload_whisper()
+        gc.collect()
+    except Exception:
+        pass  # Suppress errors during shutdown
+
+atexit.register(_graceful_shutdown)
 
 # ---------------------------------------------------------------------------
 # Logging setup - only warnings and errors to console, all levels to file
