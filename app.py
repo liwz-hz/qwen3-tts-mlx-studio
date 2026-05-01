@@ -932,7 +932,7 @@ def import_voice(audio_path, transcript, name, language):
         description="Imported voice",
         source="import",
     )
-    return f"✓ 已导入 '{name.strip()}'"
+    return _voice_table(), f"✓ 已导入 '{name.strip()}'"
 
 
 # ---------------------------------------------------------------------------
