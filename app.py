@@ -2029,8 +2029,11 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
                     lib_import_audio = gr.Audio(
                         label="Audio File", type="filepath"
                     )
+                    lib_import_transcribe_btn = gr.Button("🔄 自动转录音频", variant="secondary")
+                    gr.HTML("<div class='text-hint'>点击上方按钮自动生成转录文本，无需手动输入</div>")
                     lib_import_transcript = gr.Textbox(
-                        label="Transcript", lines=3
+                        label="Transcript（自动填充或手动输入）", lines=3,
+                        placeholder="点击 '自动转录音频' 按钮生成..."
                     )
                     lib_import_name = gr.Textbox(
                         label="Name", placeholder="imported_voice"
@@ -2611,6 +2614,12 @@ with gr.Blocks(title="Qwen3-TTS MLX Studio") as app:
         )
 
     # --- Voice Library ---
+    lib_import_transcribe_btn.click(
+        fn=transcribe_reference,
+        inputs=[lib_import_audio],
+        outputs=[lib_import_transcript, lib_status],
+        show_progress="minimal",
+    )
     lib_preview_btn.click(
         fn=preview_voice,
         inputs=[lib_selected],
